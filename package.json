@@ -1,0 +1,12 @@
+{
+  "name": "fin-carla-workspace",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Workspace scripts for Fin Carla",
+  "scripts": {
+    "dev:start": "./scripts/dev-start.sh",
+    "dev:stop": "./scripts/dev-stop.sh",
+    "dev:restart": "./scripts/dev-restart.sh",
+    "dev:status": "./scripts/dev-status.sh"
+  }
+}
