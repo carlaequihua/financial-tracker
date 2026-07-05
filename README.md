@@ -1,4 +1,6 @@
-# Fin Carla MVP
+# Financial Tracker
+
+This shit is vibe coded :P
 
 Monorepo with:
 - `backend`: Express + PostgreSQL API (modular routes/services/db)
