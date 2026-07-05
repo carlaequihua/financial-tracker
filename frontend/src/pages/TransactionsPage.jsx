@@ -62,7 +62,7 @@ export default function TransactionsPage() {
   const [filters, setFilters] = useState(() => {
     const today = new Date();
     const threeMonthsOut = new Date(today);
-    threeMonthsOut.setMonth(threeMonthsOut.getMonth() + 3); //3 months in the future
+    threeMonthsOut.setMonth(threeMonthsOut.getMonth() + 2); //3 months in the future
     return {
       from: toIsoDate(addDays(today, -60)),
       to: toIsoDate(threeMonthsOut),
