@@ -54,6 +54,8 @@ body {
 }
 
 .shell {
+  display: flex;
+  flex-direction: column;
   min-height: 100vh;
 }
 
@@ -85,10 +87,12 @@ body {
 }
 
 .content-wrap {
+  flex: 1;
   display: grid;
   grid-template-columns: 220px 1fr;
   gap: 1rem;
   padding: 1rem;
+  align-items: stretch;
 }
 
 .nav {
@@ -100,6 +104,7 @@ body {
   flex-direction: column;
   gap: 0.5rem;
   box-shadow: var(--shadow);
+  height: 100%;
 }
 
 .nav a {
@@ -414,12 +419,12 @@ body {
 
 .summary-list-header-accounts,
 .summary-list-row-accounts {
-  grid-template-columns: 1.5fr 0.8fr 1fr;
+  grid-template-columns: 1.5fr 0.8fr 0.8fr 1fr;
 }
 
 .summary-list-header-categories,
 .summary-list-row-categories {
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1.5fr 0.8fr 0.8fr 1fr;
 }
 
 .summary-row-actions {
@@ -473,6 +478,54 @@ button.danger {
   overflow: auto;
 }
 
+.transaction-cards {
+  display: none;
+  gap: 0.65rem;
+}
+
+.transaction-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  padding: 0.65rem;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.transaction-card-cleared {
+  background: color-mix(in srgb, var(--sage) 20%, var(--panel) 80%);
+}
+
+.transaction-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.transaction-card-date {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.transaction-card-desc {
+  font-weight: 600;
+}
+
+.transaction-card-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+}
+
+.transaction-card-actions {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
 .recurring-page-grid {
   grid-template-columns: 1fr;
 }
@@ -501,6 +554,72 @@ button.danger {
   padding: 0.75rem;
 }
 
+.modifications-section {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  background-color: var(--panel-soft);
+  border-radius: 6px;
+  border-left: 3px solid var(--brand);
+}
+
+.modifications-section h4 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.modification-form-container {
+  margin-top: 1rem;
+}
+
+.modification-inline-td {
+  padding: 0 !important;
+  border-bottom: none;
+}
+
+.modification-inline-container {
+  background: color-mix(in srgb, var(--brand) 6%, var(--panel) 94%);
+  border-top: 2px solid var(--brand);
+  border-bottom: 2px solid var(--brand);
+  padding: 0.85rem 1rem;
+}
+
+.modification-inline-context {
+  margin-bottom: 0.65rem;
+  font-size: 0.88rem;
+}
+
+.modification-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.modification-form .form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.modification-form label {
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.modification-form input,
+.modification-form select {
+  padding: 0.4rem;
+  font-size: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.modification-form .form-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
 .inline-edit-input {
   width: 100%;
   min-width: 90px;
@@ -512,6 +631,26 @@ button.danger {
   border: 1px dashed var(--border);
   border-radius: 8px;
   padding: 0.65rem;
+}
+
+.semiweekly-inline-group {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.semiweekly-inline-field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 100px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.recurring-start-date-field {
+  min-width: 210px;
 }
 
 .txn-type {
@@ -527,12 +666,22 @@ button.danger {
   color: var(--danger);
 }
 
+.txn-type-transfer {
+  color: var(--brand);
+  font-style: italic;
+}
+
 .txn-amount-income {
   color: var(--success);
   font-weight: 600;
 }
 
 .txn-amount-expense {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.txn-balance-negative {
   color: var(--danger);
   font-weight: 600;
 }
@@ -603,5 +752,103 @@ thead th {
   .nav {
     flex-direction: row;
     overflow-x: auto;
+  }
+}
+
+@media (max-width: 700px) {
+  .header {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .header h1 {
+    font-size: 1.1rem;
+  }
+
+  .content-wrap {
+    padding: 0.7rem;
+    gap: 0.7rem;
+  }
+
+  .card {
+    padding: 0.75rem;
+  }
+
+  .nav {
+    white-space: nowrap;
+    padding: 0.55rem;
+    gap: 0.35rem;
+  }
+
+  .nav a {
+    padding: 0.4rem 0.5rem;
+    font-size: 0.9rem;
+  }
+
+  .form-row {
+    gap: 0.45rem;
+  }
+
+  .form-row > input,
+  .form-row > select,
+  .form-row > button,
+  .form-row > .inline-filter,
+  .form-row > .semiweekly-inline-group,
+  .form-row > .semiweekly-inline-field {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .inline-filter {
+    justify-content: space-between;
+  }
+
+  .inline-actions {
+    margin-left: 0;
+    flex-wrap: wrap;
+  }
+
+  .transactions-table-wrap {
+    display: none;
+  }
+
+  .transaction-cards {
+    display: grid;
+  }
+
+  th,
+  td {
+    padding: 0.35rem;
+    font-size: 0.84rem;
+  }
+
+  .section-subtitle {
+    font-size: 0.82rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .header {
+    padding: 0.7rem;
+  }
+
+  .content-wrap {
+    padding: 0.5rem;
+  }
+
+  .card {
+    border-radius: 8px;
+    padding: 0.65rem;
+  }
+
+  input,
+  select,
+  button {
+    font-size: 0.9rem;
+    padding: 0.45rem 0.5rem;
+  }
+
+  .metric-value {
+    font-size: 1.35rem;
   }
 }

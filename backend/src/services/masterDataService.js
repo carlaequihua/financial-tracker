@@ -36,19 +36,23 @@ function normalizeOptionalBalance(balance) {
 }
 
 async function getAccountTransactionNet(id) {
+  const today = new Date().toISOString().slice(0, 10);
   const { rows } = await query(
     `
     SELECT COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE -amount END), 0)::numeric(12,2) AS txn_net
     FROM transactions
     WHERE account_id = $1
+      AND txn_date <= $2
+      AND cleared = true
     `,
-    [id]
+    [id, today]
   );
   return Number(rows[0]?.txn_net || 0);
 }
 
 export async function listAccounts() {
   await ensureAccountsSortOrder();
+  const today = new Date().toISOString().slice(0, 10);
   const { rows } = await query(
     `
     SELECT
@@ -59,10 +63,11 @@ export async function listAccounts() {
       (COALESCE(a.opening_balance, 0) + COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END), 0))::numeric(12,2) AS balance,
       COUNT(t.id)::int AS transaction_count
     FROM accounts a
-    LEFT JOIN transactions t ON t.account_id = a.id
+    LEFT JOIN transactions t ON t.account_id = a.id AND t.txn_date <= $1 AND t.cleared = true
     GROUP BY a.id, a.name, a.sort_order, a.opening_balance
     ORDER BY COALESCE(a.sort_order, 0) ASC, a.name ASC
-    `
+    `,
+    [today]
   );
   return rows;
 }
@@ -214,16 +219,36 @@ export async function setAccountsOrder(accountIds) {
 }
 
 export async function listSummary() {
-  const [accounts, categories, monthlyTotals] = await Promise.all([
+  const [accounts, categories, monthlyTotals, categoryTotals] = await Promise.all([
     listAccounts(),
     listCategories(),
-    listMonthlyTotals()
+    listMonthlyTotals(),
+    listCategoryTotals()
   ]);
   return {
     accounts,
     categories,
-    monthlyTotals
+    monthlyTotals,
+    categoryTotals
   };
+}
+
+async function listCategoryTotals() {
+  const { rows } = await query(
+    `
+    SELECT
+      c.id,
+      c.name,
+      COALESCE(SUM(CASE WHEN t.type = 'expense' THEN t.amount ELSE 0 END), 0)::numeric(12,2) AS total_spent,
+      COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE 0 END), 0)::numeric(12,2) AS total_income,
+      COUNT(t.id)::int AS transaction_count
+    FROM categories c
+    LEFT JOIN transactions t ON t.category_id = c.id
+    GROUP BY c.id, c.name
+    ORDER BY total_spent DESC, c.name ASC
+    `
+  );
+  return rows;
 }
 
 async function listMonthlyTotals() {

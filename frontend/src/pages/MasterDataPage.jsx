@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { masterDataApi } from "../api/masterData";
 import SimpleCard from "../components/SimpleCard.jsx";
+import { formatBalance } from "../utils/format.js";
 
 export default function MasterDataPage() {
   const qc = useQueryClient();
@@ -20,6 +21,7 @@ export default function MasterDataPage() {
 
   const accounts = useMemo(() => summary.data?.accounts || [], [summary.data]);
   const categories = useMemo(() => summary.data?.categories || [], [summary.data]);
+  const categoryTotals = useMemo(() => summary.data?.categoryTotals || [], [summary.data]);
   const monthlyTotals = useMemo(() => summary.data?.monthlyTotals || [], [summary.data]);
 
   const addAccount = useMutation({
@@ -174,7 +176,7 @@ export default function MasterDataPage() {
               </div>
               <div className={`metric-card ${isTotalNegative ? "metric-card-negative" : "metric-card-positive"}`}>
                 <span className="metric-label">Net Account Balance</span>
-                <strong className="metric-value">{Number(totalBalance).toFixed(2)}</strong>
+                <strong className="metric-value">{formatBalance(totalBalance)}</strong>
               </div>
             </div>
             <div className="monthly-bars-wrap">
@@ -228,7 +230,8 @@ export default function MasterDataPage() {
         <div className="summary-list">
           <div className="summary-list-header summary-list-header-accounts">
             <span>Account Name</span>
-            <span>Balance</span>
+            <span>Opening Balance</span>
+            <span>Current Balance</span>
             <span className="summary-row-actions">Actions</span>
           </div>
           {accounts.map((a) => (
@@ -271,10 +274,11 @@ export default function MasterDataPage() {
                     step="0.01"
                     value={editingAccountBalance}
                     onChange={(e) => setEditingAccountBalance(e.target.value)}
+                    title="Opening Balance - this is the starting point for balance calculations"
                   />
+                  <span>{Number(a.balance || 0).toFixed(2)}</span>
                   <span className="summary-row-actions">
-                    <button type="button" onClick={saveAccountEdit}>Save</button>
-                    <button
+                    <button type="button" onClick={saveAccountEdit}>Save</button>                    <button
                       type="button"
                       onClick={() => {
                         setEditingAccountId(null);
@@ -288,7 +292,8 @@ export default function MasterDataPage() {
               ) : (
                 <>
                   <span><strong className="drag-handle" aria-label={`Drag ${a.name}`}>↕</strong> {a.name}</span>
-                  <span>{Number(a.balance || 0).toFixed(2)}</span>
+                  <span>{Number(a.opening_balance || 0).toFixed(2)}</span>
+                  <span>{formatBalance(a.balance)}</span>
                   <span className="summary-row-actions">
                     <button type="button" onClick={() => startAccountEdit(a)}>Edit</button>
                     <button
@@ -316,17 +321,21 @@ export default function MasterDataPage() {
           <button onClick={() => { if (categoryName.trim()) { addCategory.mutate(categoryName.trim()); setCategoryName(""); } }}>Add</button>
         </div>
         {addCategory.error || updateCategory.error || removeCategory.error ? <p className="status status-error">Could not save category changes.</p> : null}
-        {!summary.isLoading && !summary.isError && categories.length === 0 ? <p className="status status-empty">No categories yet.</p> : null}
+        {!summary.isLoading && !summary.isError && categoryTotals.length === 0 ? <p className="status status-empty">No categories yet.</p> : null}
         <div className="summary-list">
           <div className="summary-list-header summary-list-header-categories">
             <span>Category Name</span>
+            <span>Total Spent</span>
+            <span>Total Income</span>
             <span className="summary-row-actions">Actions</span>
           </div>
-          {categories.map((c) => (
+          {categoryTotals.map((c) => (
             <div key={c.id} className="summary-list-row summary-list-row-categories">
               {editingCategoryId === c.id ? (
                 <>
                   <input value={editingCategoryName} onChange={(e) => setEditingCategoryName(e.target.value)} />
+                  <span>{formatBalance(-Number(c.total_spent || 0))}</span>
+                  <span>{formatBalance(Number(c.total_income || 0))}</span>
                   <span className="summary-row-actions">
                     <button type="button" onClick={saveCategoryEdit}>Save</button>
                     <button type="button" onClick={() => setEditingCategoryId(null)}>Cancel</button>
@@ -335,6 +344,8 @@ export default function MasterDataPage() {
               ) : (
                 <>
                   <span>{c.name}</span>
+                  <span className="txn-amount-expense">{Number(c.total_spent || 0) > 0 ? formatBalance(-Number(c.total_spent)) : "—"}</span>
+                  <span className="txn-amount-income">{Number(c.total_income || 0) > 0 ? formatBalance(Number(c.total_income)) : "—"}</span>
                   <span className="summary-row-actions">
                     <button type="button" onClick={() => startCategoryEdit(c)}>Edit</button>
                     <button

@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { recurringApi } from "../api/recurring";
+import { modificationsApi } from "../api/modifications";
 import { useAccounts, useCategories } from "../hooks/useSharedQueries";
 import SimpleCard from "../components/SimpleCard.jsx";
+import ModificationForm from "../components/ModificationForm.jsx";
 
 const initialForm = {
   name: "",
@@ -12,6 +14,8 @@ const initialForm = {
   future_amount_start_date: "",
   type: "expense",
   cadence: "monthly",
+  semi_month_day_1: "",
+  semi_month_day_2: "",
   start_date: new Date().toISOString().slice(0, 10),
   has_end_date: false,
   end_date: "",
@@ -24,6 +28,7 @@ export default function RecurringPage() {
   const qc = useQueryClient();
   const [form, setForm] = useState(initialForm);
   const [editingId, setEditingId] = useState(null);
+  const [showModificationForm, setShowModificationForm] = useState(false);
   const recurring = useQuery({ queryKey: ["recurring"], queryFn: recurringApi.list });
   const upcomingDays = 30;
   const upcoming = useQuery({
@@ -48,6 +53,14 @@ export default function RecurringPage() {
       qc.invalidateQueries({ queryKey: ["upcoming"] });
     }
   });
+  const createModificationM = useMutation({
+    mutationFn: (input) => modificationsApi.create(editingId, input),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["transactions-projected"] });
+      qc.invalidateQueries({ queryKey: ["upcoming"] });
+      setShowModificationForm(false);
+    }
+  });
 
   function toPayload(input) {
     return {
@@ -57,6 +70,8 @@ export default function RecurringPage() {
       future_amount_start_date: input.has_future_amount ? (input.future_amount_start_date || null) : null,
       type: input.type,
       cadence: input.cadence,
+      semi_month_day_1: input.cadence === "semiweekly" ? Number(input.semi_month_day_1) : null,
+      semi_month_day_2: input.cadence === "semiweekly" ? Number(input.semi_month_day_2) : null,
       start_date: input.start_date,
       end_date: input.has_end_date ? (input.end_date || null) : null,
       account_id: input.account_id ? Number(input.account_id) : null,
@@ -83,6 +98,8 @@ export default function RecurringPage() {
       future_amount_start_date: row.future_amount_start_date ? String(row.future_amount_start_date).slice(0, 10) : "",
       type: row.type,
       cadence: row.cadence,
+      semi_month_day_1: row.semi_month_day_1 ? String(row.semi_month_day_1) : "",
+      semi_month_day_2: row.semi_month_day_2 ? String(row.semi_month_day_2) : "",
       start_date: String(row.start_date).slice(0, 10),
       has_end_date: Boolean(row.end_date),
       end_date: row.end_date ? String(row.end_date).slice(0, 10) : "",
@@ -114,8 +131,11 @@ export default function RecurringPage() {
               <tr>
                 <th>Name</th>
                 <th>Amount</th>
+                <th>Type</th>
+                <th>Account</th>
                 <th>Cadence</th>
                 <th>Start</th>
+                <th>End</th>
                 <th>Future Change</th>
                 <th className="actions-cell">Actions</th>
               </tr>
@@ -125,8 +145,15 @@ export default function RecurringPage() {
                 <tr key={r.id}>
                   <td>{r.name}</td>
                   <td>{Number(r.amount).toFixed(2)}</td>
+                  <td>
+                    <span className={r.type === "income" ? "txn-type txn-type-income" : "txn-type txn-type-expense"}>
+                      {r.type}
+                    </span>
+                  </td>
+                  <td>{r.account_name || "-"}</td>
                   <td>{r.cadence}</td>
                   <td>{String(r.start_date).slice(0, 10)}</td>
+                  <td>{r.end_date ? String(r.end_date).slice(0, 10) : "Never"}</td>
                   <td>
                     {r.future_amount_start_date
                       ? `${Number(r.future_amount || 0).toFixed(2)} from ${String(r.future_amount_start_date).slice(0, 10)}`
@@ -155,6 +182,7 @@ export default function RecurringPage() {
         </div>
 
         {editingId ? (
+          <>
           <form className="form-grid recurring-edit-form" onSubmit={onSubmit}>
             <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Name" />
             <input type="number" step="0.01" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} placeholder="Current amount" />
@@ -165,9 +193,31 @@ export default function RecurringPage() {
             <select value={form.cadence} onChange={(e) => setForm({ ...form, cadence: e.target.value })}>
               <option value="daily">Daily</option>
               <option value="weekly">Weekly</option>
+              <option value="biweekly">Biweekly (every other week)</option>
+              <option value="semiweekly">Semiweekly (twice a month)</option>
               <option value="monthly">Monthly</option>
               <option value="yearly">Yearly</option>
             </select>
+            {form.cadence === "semiweekly" ? (
+              <>
+                <input
+                  type="number"
+                  min="1"
+                  max="31"
+                  placeholder="First day (1-31)"
+                  value={form.semi_month_day_1}
+                  onChange={(e) => setForm({ ...form, semi_month_day_1: e.target.value })}
+                />
+                <input
+                  type="number"
+                  min="1"
+                  max="31"
+                  placeholder="Second day (1-31)"
+                  value={form.semi_month_day_2}
+                  onChange={(e) => setForm({ ...form, semi_month_day_2: e.target.value })}
+                />
+              </>
+            ) : null}
             <input type="date" value={form.start_date} onChange={(e) => setForm({ ...form, start_date: e.target.value })} />
             <label className="checkbox-row">
               <input
@@ -232,6 +282,30 @@ export default function RecurringPage() {
               <button type="button" onClick={cancelEdit}>Cancel</button>
             </span>
           </form>
+          
+          <div className="modifications-section">
+            <h4>Modify This Recurring Entry</h4>
+            <p className="status">Override specific occurrences, future dates, or date ranges:</p>
+            
+            {showModificationForm ? (
+              <div className="modification-form-container">
+                <ModificationForm
+                  recurringRule={{ id: editingId }}
+                  accounts={accounts.data || []}
+                  categories={categories.data || []}
+                  isLoading={createModificationM.isPending}
+                  onSave={(input) => createModificationM.mutate(input)}
+                  onCancel={() => setShowModificationForm(false)}
+                />
+                {createModificationM.error && (
+                  <p className="status status-error">Error creating modification: {createModificationM.error.message}</p>
+                )}
+              </div>
+            ) : (
+              <button type="button" onClick={() => setShowModificationForm(true)}>+ Add Modification</button>
+            )}
+          </div>
+          </>
         ) : null}
 
         <h3 className="section-subtitle">Upcoming Expenses (30 days)</h3>
@@ -240,11 +314,30 @@ export default function RecurringPage() {
         {!upcoming.isLoading && !upcoming.isError && (upcoming.data || []).length === 0 ? (
           <p className="status status-empty">No upcoming expenses in the next 30 days.</p>
         ) : null}
-        <ul>
-          {(upcoming.data || []).map((r) => (
-            <li key={r.id}>{r.name} - {r.amount} due {String(r.next_due_date || r.start_date).slice(0, 10)}</li>
-          ))}
-        </ul>
+        {!upcoming.isLoading && !upcoming.isError && (upcoming.data || []).length > 0 ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Amount</th>
+                  <th>Due Date</th>
+                  <th>Cadence</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(upcoming.data || []).map((r) => (
+                  <tr key={r.id}>
+                    <td>{r.description || r.name}</td>
+                    <td>{Number(r.amount || 0).toFixed(2)}</td>
+                    <td>{String(r.next_due_date || r.txn_date || r.start_date).slice(0, 10)}</td>
+                    <td>{r.cadence}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
       </SimpleCard>
       </div>
     </div>

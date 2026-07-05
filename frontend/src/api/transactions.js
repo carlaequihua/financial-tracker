@@ -22,6 +22,7 @@ function toQuery(filters = {}) {
 
 export const transactionsApi = {
   list: (filters = {}) => api.get(`/api/transactions${toQuery(filters)}`),
+  projected: (filters = {}) => api.get(`/api/transactions/projected${toQuery(filters)}`),
   create: (payload) => api.post("/api/transactions", payload),
   update: (id, payload) => api.put(`/api/transactions/${id}`, payload),
   setCleared: (id, cleared) => api.patch(`/api/transactions/${id}/cleared`, { cleared }),

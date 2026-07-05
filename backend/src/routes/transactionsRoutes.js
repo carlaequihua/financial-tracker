@@ -6,6 +6,7 @@ import {
   deleteTransaction,
   setTransactionCleared
 } from "../services/transactionsService.js";
+import { getProjectedTransactions } from "../services/analyticsService.js";
 
 const router = Router();
 
@@ -20,6 +21,21 @@ router.get("/", async (req, res, next) => {
       cleared: req.query.cleared === undefined ? undefined : req.query.cleared === "true"
     };
     res.json(await listTransactions(filters));
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.get("/projected", async (req, res, next) => {
+  try {
+    const filters = {
+      from: req.query.from,
+      to: req.query.to,
+      type: req.query.type,
+      account_id: req.query.account_id,
+      category_id: req.query.category_id
+    };
+    res.json(await getProjectedTransactions(filters));
   } catch (e) {
     next(e);
   }
