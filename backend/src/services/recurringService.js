@@ -6,8 +6,8 @@ function validateRecurringInput(input) {
     err.status = 400;
     throw err;
   }
-  if (!["income", "expense"].includes(input.type)) {
-    const err = new Error("type must be income or expense");
+  if (!["income", "expense", "transfer"].includes(input.type)) {
+    const err = new Error("type must be income, expense, or transfer");
     err.status = 400;
     throw err;
   }
@@ -25,6 +25,21 @@ function validateRecurringInput(input) {
     const err = new Error("end_date cannot be before start_date");
     err.status = 400;
     throw err;
+  }
+
+  const fromAccountId = Number(input.from_account_id);
+  const toAccountId = Number(input.to_account_id);
+  if (input.type === "transfer") {
+    if (!Number.isInteger(fromAccountId) || fromAccountId <= 0 || !Number.isInteger(toAccountId) || toAccountId <= 0) {
+      const err = new Error("transfer recurring entries require from_account_id and to_account_id");
+      err.status = 400;
+      throw err;
+    }
+    if (fromAccountId === toAccountId) {
+      const err = new Error("transfer recurring entries require different accounts");
+      err.status = 400;
+      throw err;
+    }
   }
 
   if ((input.cadence || "monthly") === "semiweekly") {
@@ -70,7 +85,20 @@ function validateRecurringInput(input) {
 }
 
 export async function listRecurring() {
-  const { rows } = await query("SELECT * FROM recurring_entries ORDER BY id DESC");
+  const { rows } = await query(`
+    SELECT
+      r.*,
+      af.name AS from_account_name,
+      at.name AS to_account_name,
+      a.name AS account_name,
+      c.name AS category_name
+    FROM recurring_entries r
+    LEFT JOIN accounts af ON af.id = r.from_account_id
+    LEFT JOIN accounts at ON at.id = r.to_account_id
+    LEFT JOIN accounts a ON a.id = r.account_id
+    LEFT JOIN categories c ON c.id = r.category_id
+    ORDER BY r.id DESC
+  `);
   return rows;
 }
 
@@ -79,8 +107,8 @@ export async function createRecurring(input) {
   const sql = `
     INSERT INTO recurring_entries
     (name, amount, type, cadence, start_date, end_date, account_id, category_id, active, future_amount, future_amount_start_date,
-     semi_month_day_1, semi_month_day_2)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     semi_month_day_1, semi_month_day_2, from_account_id, to_account_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
     RETURNING *
   `;
   const params = [
@@ -90,13 +118,15 @@ export async function createRecurring(input) {
     input.cadence || "monthly",
     input.start_date,
     input.end_date || null,
-    input.account_id || null,
+    input.type === "transfer" ? null : (input.account_id || null),
     input.category_id || null,
     input.active !== false,
     input.future_amount === undefined || input.future_amount === null || input.future_amount === "" ? null : Number(input.future_amount),
     input.future_amount_start_date || null,
     input.cadence === "semiweekly" ? Number(input.semi_month_day_1) : null,
-    input.cadence === "semiweekly" ? Number(input.semi_month_day_2) : null
+    input.cadence === "semiweekly" ? Number(input.semi_month_day_2) : null,
+    input.type === "transfer" ? Number(input.from_account_id) : null,
+    input.type === "transfer" ? Number(input.to_account_id) : null
   ];
   const { rows } = await query(sql, params);
   return rows[0];
@@ -107,8 +137,9 @@ export async function updateRecurring(id, input) {
   const sql = `
     UPDATE recurring_entries
     SET name=$1, amount=$2, type=$3, cadence=$4, start_date=$5, end_date=$6, account_id=$7, category_id=$8, active=$9,
-        future_amount=$10, future_amount_start_date=$11, semi_month_day_1=$12, semi_month_day_2=$13
-    WHERE id=$14
+        future_amount=$10, future_amount_start_date=$11, semi_month_day_1=$12, semi_month_day_2=$13,
+        from_account_id=$14, to_account_id=$15
+    WHERE id=$16
     RETURNING *
   `;
   const params = [
@@ -118,13 +149,15 @@ export async function updateRecurring(id, input) {
     input.cadence || "monthly",
     input.start_date,
     input.end_date || null,
-    input.account_id || null,
+    input.type === "transfer" ? null : (input.account_id || null),
     input.category_id || null,
     input.active !== false,
     input.future_amount === undefined || input.future_amount === null || input.future_amount === "" ? null : Number(input.future_amount),
     input.future_amount_start_date || null,
     input.cadence === "semiweekly" ? Number(input.semi_month_day_1) : null,
     input.cadence === "semiweekly" ? Number(input.semi_month_day_2) : null,
+    input.type === "transfer" ? Number(input.from_account_id) : null,
+    input.type === "transfer" ? Number(input.to_account_id) : null,
     id
   ];
   const { rows } = await query(sql, params);

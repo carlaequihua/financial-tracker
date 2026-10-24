@@ -1,4 +1,6 @@
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { ArrowDown, ArrowUp } from "lucide-react";
+import { compareTransactions, transactionOrderKey } from "../../../shared/transactionList.js";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { normalizeTransactionFilters, transactionsApi } from "../api/transactions";
 import { recurringApi } from "../api/recurring";
@@ -25,6 +27,46 @@ function getProjectedOccurrenceAnchor(row) {
   return match ? match[1] : String(row?.txn_date || "").slice(0, 10);
 }
 
+function getSuggestionDescription(row) {
+  const description = String(row?.description || "").trim();
+  if (!description) return "";
+  // Transfer rows are stored as "<base> (Transfer to/from ... )"; strip suffix for better reuse.
+  if (row?.transfer_pair_id) {
+    return description.replace(/\s*\(Transfer\s+(to|from)\s+.*\)$/i, "").trim();
+  }
+  return description;
+}
+
+function normalizeSuggestionText(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLocaleLowerCase();
+}
+
+function buildSuggestionItems({ strictOptions = [], allOptions = [], query = "", limit = 8 }) {
+  const normalizedQuery = normalizeSuggestionText(query);
+  if (!normalizedQuery) return [];
+
+  const strictMatches = strictOptions.filter((value) => {
+    const normalized = normalizeSuggestionText(value);
+    return normalized.includes(normalizedQuery) && normalized !== normalizedQuery;
+  });
+
+  const strictSet = new Set(strictMatches.map((value) => normalizeSuggestionText(value)));
+  const fallbackMatches = allOptions.filter((value) => {
+    const normalized = normalizeSuggestionText(value);
+    if (!normalized || strictSet.has(normalized)) return false;
+    return normalized.includes(normalizedQuery) && normalized !== normalizedQuery;
+  });
+
+  return [
+    ...strictMatches.map((value) => ({ value, scope: "current" })),
+    ...fallbackMatches.map((value) => ({ value, scope: "other" }))
+  ].slice(0, limit);
+}
+
 const initialForm = {
   txn_date: new Date().toISOString().slice(0, 10),
   description: "",
@@ -48,6 +90,8 @@ const initialRecurringForm = {
   start_date: new Date().toISOString().slice(0, 10),
   account_id: "",
   category_id: "",
+  from_account_id: "",
+  to_account_id: "",
   active: true
 };
 
@@ -59,6 +103,13 @@ export default function TransactionsPage() {
   const [entryMode, setEntryMode] = useState("one-time");
   const [editingRows, setEditingRows] = useState({});
   const [modificationTarget, setModificationTarget] = useState(null);
+  const [hiddenTransactionIds, setHiddenTransactionIds] = useState({});
+  const [hiddenOccurrenceKeys, setHiddenOccurrenceKeys] = useState({});
+  const [skippingOccurrenceKeys, setSkippingOccurrenceKeys] = useState({});
+  const [showDescriptionSuggestions, setShowDescriptionSuggestions] = useState(false);
+  const [activeDescriptionSuggestionIndex, setActiveDescriptionSuggestionIndex] = useState(-1);
+  const [activeEditSuggestionRowId, setActiveEditSuggestionRowId] = useState(null);
+  const [activeEditSuggestionIndex, setActiveEditSuggestionIndex] = useState(-1);
   const [filters, setFilters] = useState(() => {
     const today = new Date();
     const threeMonthsOut = new Date(today);
@@ -69,13 +120,15 @@ export default function TransactionsPage() {
       account_id: "",
       category_id: "",
       type: "",
-      cleared: ""
+      cleared: "",
+      search: ""
     };
   });
   const [inputError, setInputError] = useState("");
   const [dateSort, setDateSort] = useState("desc");
   const [includeProjected, setIncludeProjected] = useState(true);
-  const normalizedFilters = normalizeTransactionFilters(filters);
+  const deferredSearch = useDeferredValue(filters.search);
+  const normalizedFilters = normalizeTransactionFilters({ ...filters, search: deferredSearch });
   const todayIso = toIsoDate(new Date());
   const shouldLoadProjected = includeProjected && Boolean(normalizedFilters.to && normalizedFilters.to > todayIso);
   const projectedFilters = useMemo(() => {
@@ -97,6 +150,13 @@ export default function TransactionsPage() {
     qc.invalidateQueries({ queryKey: ["summary"] });
     qc.invalidateQueries({ queryKey: ["accounts"] });
   };
+
+  function getOccurrenceKeyFromRow(row) {
+    if (!row?.recurring_rule_id) return "";
+    const anchorDate = getProjectedOccurrenceAnchor(row);
+    if (!anchorDate) return "";
+    return `${row.recurring_rule_id}|${anchorDate}`;
+  }
 
   const tx = useQuery({
     queryKey: ["transactions", normalizedFilters],
@@ -148,8 +208,24 @@ export default function TransactionsPage() {
       refreshTransactionsQueries();
     }
   });
+  const reorderM = useMutation({
+    mutationFn: transactionsApi.reorder,
+    onSuccess: refreshTransactionsQueries
+  });
   const deleteM = useMutation({
     mutationFn: transactionsApi.remove,
+    onMutate: async (id) => {
+      setHiddenTransactionIds((prev) => ({ ...prev, [String(id)]: true }));
+      return { id: String(id) };
+    },
+    onError: (_error, _vars, ctx) => {
+      if (!ctx?.id) return;
+      setHiddenTransactionIds((prev) => {
+        const next = { ...prev };
+        delete next[ctx.id];
+        return next;
+      });
+    },
     onSuccess: () => {
       refreshTransactionsQueries();
     }
@@ -191,6 +267,58 @@ export default function TransactionsPage() {
       setModificationTarget(null);
     }
   });
+  const skipOccurrenceM = useMutation({
+    mutationFn: async (target) => {
+      const occurrenceAnchorDate = target?.occurrence_anchor_date || target?.txn_date;
+      if (!target?.recurring_rule_id || !occurrenceAnchorDate) {
+        throw new Error("Could not determine recurring occurrence to skip.");
+      }
+      return modificationsApi.create(target.recurring_rule_id, {
+        modification_type: "one_time",
+        start_date: occurrenceAnchorDate,
+        override_txn_date: null,
+        amount: null,
+        description: null,
+        account_id: null,
+        category_id: null,
+        is_deleted: true
+      });
+    },
+    onMutate: async (target) => {
+      const key = `${target.recurring_rule_id}|${target.occurrence_anchor_date || target.txn_date}`;
+      setSkippingOccurrenceKeys((prev) => ({ ...prev, [key]: true }));
+      setHiddenOccurrenceKeys((prev) => ({ ...prev, [key]: true }));
+      return { key };
+    },
+    onError: (_error, _vars, ctx) => {
+      if (!ctx?.key) return;
+      setHiddenOccurrenceKeys((prev) => {
+        const next = { ...prev };
+        delete next[ctx.key];
+        return next;
+      });
+      setSkippingOccurrenceKeys((prev) => {
+        const next = { ...prev };
+        delete next[ctx.key];
+        return next;
+      });
+    },
+    onSuccess: (_data, vars) => {
+      const rowKey = String(vars?.rowId || "");
+      if (modificationTarget?.rowId && String(modificationTarget.rowId) === rowKey) {
+        setModificationTarget(null);
+      }
+      refreshTransactionsQueries();
+    },
+    onSettled: (_data, _error, _vars, ctx) => {
+      if (!ctx?.key) return;
+      setSkippingOccurrenceKeys((prev) => {
+        const next = { ...prev };
+        delete next[ctx.key];
+        return next;
+      });
+    }
+  });
 
   const accountsById = useMemo(() => {
     const map = new Map();
@@ -203,6 +331,61 @@ export default function TransactionsPage() {
     for (const row of categories.data || []) map.set(String(row.id), row.name);
     return map;
   }, [categories.data]);
+
+  const descriptionSourceRows = useMemo(() => {
+    const rows = balanceTx.data || tx.data || [];
+    return Array.isArray(rows) ? rows : [];
+  }, [balanceTx.data, tx.data]);
+
+  const allDescriptionOptions = useMemo(() => {
+    const seen = new Set();
+    const results = [];
+    for (const row of descriptionSourceRows) {
+      const description = getSuggestionDescription(row);
+      if (!description) continue;
+      const key = normalizeSuggestionText(description);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      results.push(description);
+    }
+    return results;
+  }, [descriptionSourceRows]);
+
+  const descriptionOptions = useMemo(() => {
+    const seen = new Set();
+    const results = [];
+    const targetType = form.type;
+    const targetAccount = targetType === "transfer" ? "" : form.account_id;
+
+    for (const row of descriptionSourceRows) {
+      const description = getSuggestionDescription(row);
+      if (!description) continue;
+      if (targetType === "transfer") {
+        if (!row.transfer_pair_id) continue;
+      } else if (row.type !== targetType) {
+        continue;
+      }
+      if (targetAccount && String(row.account_id || "") !== String(targetAccount)) continue;
+      const key = normalizeSuggestionText(description);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push(description);
+    }
+    return results;
+  }, [descriptionSourceRows, form.type, form.account_id]);
+
+  const filteredDescriptionOptions = useMemo(() => {
+    return buildSuggestionItems({
+      strictOptions: descriptionOptions,
+      allOptions: allDescriptionOptions,
+      query: form.description,
+      limit: 8
+    });
+  }, [descriptionOptions, allDescriptionOptions, form.description]);
+
+  useEffect(() => {
+    setActiveDescriptionSuggestionIndex(-1);
+  }, [form.description, form.type, form.account_id]);
 
   const mergedTransactions = useMemo(() => {
     // ── display set (respects all filters) ──────────────────────────────────
@@ -222,10 +405,7 @@ export default function TransactionsPage() {
     const allReal = balanceTx.data || [];
     const allProjected = shouldLoadProjected ? (balanceProjTx.data || []) : [];
     const allForBalance = [...allReal, ...allProjected];
-    allForBalance.sort((a, b) => {
-      const d = String(a.txn_date).localeCompare(String(b.txn_date));
-      return d !== 0 ? d : String(a.id).localeCompare(String(b.id));
-    });
+    allForBalance.sort(compareTransactions);
 
     // Running balance from opening_balance forward through ALL transactions
     const accountBalanceMap = new Map();
@@ -248,17 +428,53 @@ export default function TransactionsPage() {
       account_balance_as_of: row.account_id ? (accountBalanceMap.get(String(row.id)) ?? null) : null
     }));
 
-    withBalance.sort((a, b) => {
-      const d = dateSort === "asc"
-        ? String(a.txn_date).localeCompare(String(b.txn_date))
-        : String(b.txn_date).localeCompare(String(a.txn_date));
-      if (d !== 0) return d;
-      return dateSort === "asc"
-        ? String(a.id).localeCompare(String(b.id))
-        : String(b.id).localeCompare(String(a.id));
-    });
+    withBalance.sort((left, right) => dateSort === "asc"
+      ? compareTransactions(left, right)
+      : compareTransactions(right, left));
     return withBalance;
   }, [tx.data, projectedTx.data, balanceTx.data, balanceProjTx.data, shouldLoadProjected, dateSort, todayIso, accounts.data]);
+
+  const visibleTransactions = useMemo(() => {
+    return mergedTransactions.filter((row) => {
+      if (hiddenTransactionIds[String(row.id)]) return false;
+      const occurrenceKey = getOccurrenceKeyFromRow(row);
+      if (occurrenceKey && hiddenOccurrenceKeys[occurrenceKey]) return false;
+      return true;
+    });
+  }, [mergedTransactions, hiddenOccurrenceKeys, hiddenTransactionIds]);
+
+  function renderOrderControls(row) {
+    const sameDate = visibleTransactions.filter((candidate) => candidate.txn_date === row.txn_date);
+    const index = sameDate.findIndex((candidate) => candidate.id === row.id);
+    const busy = reorderM.isPending || tx.isFetching || projectedTx.isFetching || Boolean(editingRows[row.id]);
+    return (
+      <span className="transaction-order-controls">
+        {[-1, 1].map((direction) => {
+          const target = sameDate[index + direction];
+          const label = direction < 0 ? "Move up within this date" : "Move down within this date";
+          const Icon = direction < 0 ? ArrowUp : ArrowDown;
+          return (
+            <button
+              key={direction}
+              type="button"
+              className="transaction-order-button"
+              title={label}
+              aria-label={`${label}: ${row.description}`}
+              disabled={!target || busy}
+              onClick={() => reorderM.mutate({
+                date: String(row.txn_date).slice(0, 10),
+                key: transactionOrderKey(row),
+                target_key: transactionOrderKey(target),
+                placement: (direction < 0) === (dateSort === "asc") ? "before" : "after"
+              })}
+            >
+              <Icon size={16} aria-hidden="true" />
+            </button>
+          );
+        })}
+      </span>
+    );
+  }
 
   function toPayload(input) {
     return {
@@ -283,6 +499,35 @@ export default function TransactionsPage() {
       return { ok: false, error: "Amount must be a valid non-negative number." };
     }
     return { ok: true, value };
+  }
+
+  function getEditDescriptionOptions(row) {
+    const seen = new Set();
+    const results = [];
+    const rowType = editingRows[row.id]?.type || row.type;
+    const rowAccountId = editingRows[row.id]?.account_id || row.account_id;
+
+    for (const candidate of descriptionSourceRows) {
+      const description = getSuggestionDescription(candidate);
+      if (!description) continue;
+      if (candidate.type !== rowType) continue;
+      if (rowAccountId && String(candidate.account_id || "") !== String(rowAccountId)) continue;
+      const key = normalizeSuggestionText(description);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push(description);
+    }
+    return results;
+  }
+
+  function getFilteredEditDescriptionOptions(row) {
+    const options = getEditDescriptionOptions(row);
+    return buildSuggestionItems({
+      strictOptions: options,
+      allOptions: allDescriptionOptions,
+      query: editingRows[row.id]?.description,
+      limit: 8
+    });
   }
 
   function onSubmit(e) {
@@ -396,6 +641,8 @@ export default function TransactionsPage() {
       end_date: null,
       account_id: recurringForm.account_id ? Number(recurringForm.account_id) : null,
       category_id: recurringForm.category_id ? Number(recurringForm.category_id) : null,
+      from_account_id: recurringForm.type === "transfer" ? Number(recurringForm.from_account_id) : null,
+      to_account_id: recurringForm.type === "transfer" ? Number(recurringForm.to_account_id) : null,
       active: Boolean(recurringForm.active)
     });
   }
@@ -415,6 +662,16 @@ export default function TransactionsPage() {
     <SimpleCard title="Transactions">
       <h3 className="section-subtitle">Filter Transactions</h3>
       <div className="form-row">
+        <label className="inline-filter">
+          <span>Search</span>
+          <input
+            type="search"
+            aria-label="Search transactions"
+            placeholder={filters.account_id ? "Search this account" : "Search all accounts"}
+            value={filters.search}
+            onChange={(event) => setFilters((current) => ({ ...current, search: event.target.value }))}
+          />
+        </label>
         <input type="date" value={filters.from} onChange={(e) => setFilters((f) => ({ ...f, from: e.target.value }))} />
         <input type="date" value={filters.to} onChange={(e) => setFilters((f) => ({ ...f, to: e.target.value }))} />
         <label className="inline-filter">
@@ -469,11 +726,79 @@ export default function TransactionsPage() {
       {entryMode === "one-time" ? (
         <form className="form-row" onSubmit={onSubmit}>
           <input type="date" value={form.txn_date} onChange={(e) => setForm({ ...form, txn_date: e.target.value })} />
-          <input
-            placeholder={form.type === "transfer" ? "Transfer note (optional)" : "Description"}
-            value={form.description}
-            onChange={(e) => setForm({ ...form, description: e.target.value })}
-          />
+          <div className="autocomplete-field">
+            <input
+              className="autocomplete-input"
+              placeholder={form.type === "transfer" ? "Transfer note (optional)" : "Description"}
+              value={form.description}
+              onFocus={() => setShowDescriptionSuggestions(true)}
+              onBlur={() => setTimeout(() => {
+                setShowDescriptionSuggestions(false);
+                setActiveDescriptionSuggestionIndex(-1);
+              }, 120)}
+              onKeyDown={(e) => {
+                if (!filteredDescriptionOptions.length) return;
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setShowDescriptionSuggestions(true);
+                  setActiveDescriptionSuggestionIndex((prev) => (prev >= filteredDescriptionOptions.length - 1 ? 0 : prev + 1));
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setShowDescriptionSuggestions(true);
+                  setActiveDescriptionSuggestionIndex((prev) => (prev <= 0 ? filteredDescriptionOptions.length - 1 : prev - 1));
+                  return;
+                }
+                if (e.key === "Enter" && showDescriptionSuggestions && activeDescriptionSuggestionIndex >= 0) {
+                  e.preventDefault();
+                  const selected = filteredDescriptionOptions[activeDescriptionSuggestionIndex]?.value;
+                  if (selected) {
+                    setForm((prev) => ({ ...prev, description: selected }));
+                    setShowDescriptionSuggestions(false);
+                    setActiveDescriptionSuggestionIndex(-1);
+                  }
+                  return;
+                }
+                if (e.key === "Escape") {
+                  setShowDescriptionSuggestions(false);
+                  setActiveDescriptionSuggestionIndex(-1);
+                }
+              }}
+              onChange={(e) => {
+                setForm({ ...form, description: e.target.value });
+                setShowDescriptionSuggestions(true);
+                setActiveDescriptionSuggestionIndex(-1);
+              }}
+            />
+            {showDescriptionSuggestions && filteredDescriptionOptions.length > 0 ? (
+              <div className="autocomplete-menu" role="listbox" aria-label="Description suggestions">
+                {filteredDescriptionOptions.some((item) => item.scope === "current") ? (
+                  <div className="autocomplete-section-label">Matches in current type/account</div>
+                ) : null}
+                {filteredDescriptionOptions.map((item, index) => (
+                  <Fragment key={`${item.scope}-${item.value}`}>
+                    {item.scope === "other" && (index === 0 || filteredDescriptionOptions[index - 1].scope !== "other") ? (
+                      <div className="autocomplete-section-label">Other matches</div>
+                    ) : null}
+                    <button
+                      type="button"
+                      className={index === activeDescriptionSuggestionIndex ? "autocomplete-option is-active" : "autocomplete-option"}
+                      onMouseEnter={() => setActiveDescriptionSuggestionIndex(index)}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        setForm((prev) => ({ ...prev, description: item.value }));
+                        setShowDescriptionSuggestions(false);
+                        setActiveDescriptionSuggestionIndex(-1);
+                      }}
+                    >
+                      {item.value}
+                    </button>
+                  </Fragment>
+                ))}
+              </div>
+            ) : null}
+          </div>
           <input placeholder="Amount" type="text" inputMode="decimal" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} />
           <select
             value={form.type}
@@ -538,6 +863,7 @@ export default function TransactionsPage() {
           <select value={recurringForm.type} onChange={(e) => setRecurringForm({ ...recurringForm, type: e.target.value })}>
             <option value="expense">Expense</option>
             <option value="income">Income</option>
+            <option value="transfer">Transfer</option>
           </select>
           <select value={recurringForm.cadence} onChange={(e) => setRecurringForm({ ...recurringForm, cadence: e.target.value })}>
             <option value="daily">Daily</option>
@@ -579,40 +905,66 @@ export default function TransactionsPage() {
               onChange={(e) => setRecurringForm({ ...recurringForm, start_date: e.target.value })}
             />
           </label>
-          <select value={recurringForm.account_id} onChange={(e) => setRecurringForm({ ...recurringForm, account_id: e.target.value })}>
-            <option value="">No account</option>
-            {(accounts.data || []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
-          </select>
-          <select value={recurringForm.category_id} onChange={(e) => setRecurringForm({ ...recurringForm, category_id: e.target.value })}>
-            <option value="">No category</option>
-            {(categories.data || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
+          {recurringForm.type === "transfer" ? (
+            <>
+              <label className="inline-filter">
+                <span>From account</span>
+                <select value={recurringForm.from_account_id} onChange={(e) => setRecurringForm({ ...recurringForm, from_account_id: e.target.value })}>
+                  <option value="">Select source account</option>
+                  {(accounts.data || []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </label>
+              <label className="inline-filter">
+                <span>To account</span>
+                <select value={recurringForm.to_account_id} onChange={(e) => setRecurringForm({ ...recurringForm, to_account_id: e.target.value })}>
+                  <option value="">Select destination account</option>
+                  {(accounts.data || []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </label>
+              <select value={recurringForm.category_id} onChange={(e) => setRecurringForm({ ...recurringForm, category_id: e.target.value })}>
+                <option value="">No category</option>
+                {(categories.data || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </>
+          ) : (
+            <>
+              <select value={recurringForm.account_id} onChange={(e) => setRecurringForm({ ...recurringForm, account_id: e.target.value })}>
+                <option value="">No account</option>
+                {(accounts.data || []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+              <select value={recurringForm.category_id} onChange={(e) => setRecurringForm({ ...recurringForm, category_id: e.target.value })}>
+                <option value="">No category</option>
+                {(categories.data || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </>
+          )}
           <button type="submit">Add Recurring</button>
         </form>
       )}
 
       <p className="status">Use Entry Type to switch between adding one-time transactions and recurring entries.</p>
       {inputError ? <p className="status status-error">{inputError}</p> : null}
-      {createM.error || updateM.error || deleteM.error || setClearedM.error || createRecurringM.error ? (
+      {reorderM.error ? <p className="status status-error">Could not change order: {reorderM.error.message}</p> : null}
+      {createM.error || updateM.error || deleteM.error || setClearedM.error || createRecurringM.error || createModificationM.error || skipOccurrenceM.error ? (
         <p className="status status-error">Action failed. Please try again.</p>
       ) : null}
       {addCategoryM.error ? <p className="status status-error">Could not add category.</p> : null}
 
       {tx.isLoading || (shouldLoadProjected && projectedTx.isLoading) ? <p className="status">Loading transactions...</p> : null}
       {tx.isError || (shouldLoadProjected && projectedTx.isError) ? <p className="status status-error">Failed to load transactions.</p> : null}
-      {!tx.isLoading && !(shouldLoadProjected && projectedTx.isLoading) && !tx.isError && !(shouldLoadProjected && projectedTx.isError) && mergedTransactions.length === 0 ? (
+      {!tx.isLoading && !(shouldLoadProjected && projectedTx.isLoading) && !tx.isError && !(shouldLoadProjected && projectedTx.isError) && visibleTransactions.length === 0 ? (
         <p className="status status-empty">No transactions found for the current filters.</p>
       ) : null}
 
       <div className="table-wrap transactions-table-wrap">
-        <table>
+        <table className="transactions-table">
           <thead>
             <tr>
-              <th>Date</th><th>Description</th><th>Amount</th><th>Type</th><th>Account</th><th>Account Balance</th><th>Category</th><th>One-time</th><th>Cleared</th><th>Actions</th>
+              <th className="col-date">Date</th><th className="col-description">Description</th><th className="col-amount">Amount</th><th className="col-type">Type</th><th className="col-account">Account</th><th className="col-balance">Account Balance</th><th className="col-category">Category</th><th className="col-one-time">One-time</th><th className="col-cleared">Cleared</th><th className="col-actions">Actions</th>
             </tr>
           </thead>
           <tbody>
-            {mergedTransactions.map((t) => (
+            {visibleTransactions.map((t) => (
               <Fragment key={t.id}>
               <tr className={!t.is_projected_recurring && t.cleared ? "transaction-row-cleared" : undefined}>
                 {editingRows[t.id] ? (
@@ -626,11 +978,86 @@ export default function TransactionsPage() {
                       />
                     </td>
                     <td>
-                      <input
-                        className="inline-edit-input"
-                        value={editingRows[t.id].description}
-                        onChange={(e) => updateEditingRow(t.id, "description", e.target.value)}
-                      />
+                      {(() => {
+                        const filteredEditOptions = getFilteredEditDescriptionOptions(t);
+                        return (
+                          <div className="autocomplete-field autocomplete-field-inline">
+                            <input
+                              className="inline-edit-input autocomplete-input"
+                              value={editingRows[t.id].description}
+                              onFocus={() => {
+                                setActiveEditSuggestionRowId(t.id);
+                                setActiveEditSuggestionIndex(-1);
+                              }}
+                              onBlur={() => setTimeout(() => {
+                                setActiveEditSuggestionRowId(null);
+                                setActiveEditSuggestionIndex(-1);
+                              }, 120)}
+                              onKeyDown={(e) => {
+                                if (!filteredEditOptions.length) return;
+                                if (e.key === "ArrowDown") {
+                                  e.preventDefault();
+                                  setActiveEditSuggestionRowId(t.id);
+                                  setActiveEditSuggestionIndex((prev) => (prev >= filteredEditOptions.length - 1 ? 0 : prev + 1));
+                                  return;
+                                }
+                                if (e.key === "ArrowUp") {
+                                  e.preventDefault();
+                                  setActiveEditSuggestionRowId(t.id);
+                                  setActiveEditSuggestionIndex((prev) => (prev <= 0 ? filteredEditOptions.length - 1 : prev - 1));
+                                  return;
+                                }
+                                if (e.key === "Enter" && activeEditSuggestionRowId === t.id && activeEditSuggestionIndex >= 0) {
+                                  e.preventDefault();
+                                  const selected = filteredEditOptions[activeEditSuggestionIndex]?.value;
+                                  if (selected) {
+                                    updateEditingRow(t.id, "description", selected);
+                                    setActiveEditSuggestionRowId(null);
+                                    setActiveEditSuggestionIndex(-1);
+                                  }
+                                  return;
+                                }
+                                if (e.key === "Escape") {
+                                  setActiveEditSuggestionRowId(null);
+                                  setActiveEditSuggestionIndex(-1);
+                                }
+                              }}
+                              onChange={(e) => {
+                                updateEditingRow(t.id, "description", e.target.value);
+                                setActiveEditSuggestionRowId(t.id);
+                                setActiveEditSuggestionIndex(-1);
+                              }}
+                            />
+                            {activeEditSuggestionRowId === t.id && filteredEditOptions.length > 0 ? (
+                              <div className="autocomplete-menu" role="listbox" aria-label="Edit description suggestions">
+                                {filteredEditOptions.some((item) => item.scope === "current") ? (
+                                  <div className="autocomplete-section-label">Matches in current type/account</div>
+                                ) : null}
+                                {filteredEditOptions.map((item, index) => (
+                                  <Fragment key={`${item.scope}-${item.value}`}>
+                                    {item.scope === "other" && (index === 0 || filteredEditOptions[index - 1].scope !== "other") ? (
+                                      <div className="autocomplete-section-label">Other matches</div>
+                                    ) : null}
+                                    <button
+                                      type="button"
+                                      className={index === activeEditSuggestionIndex ? "autocomplete-option is-active" : "autocomplete-option"}
+                                      onMouseEnter={() => setActiveEditSuggestionIndex(index)}
+                                      onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        updateEditingRow(t.id, "description", item.value);
+                                        setActiveEditSuggestionRowId(null);
+                                        setActiveEditSuggestionIndex(-1);
+                                      }}
+                                    >
+                                      {item.value}
+                                    </button>
+                                  </Fragment>
+                                ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })()}
                     </td>
                     <td>
                       <input
@@ -691,8 +1118,10 @@ export default function TransactionsPage() {
                   </>
                 ) : (
                   <>
-                    <td>{String(t.txn_date).slice(0, 10)}</td>
-                    <td>{t.description}</td>
+                    <td className="col-date">{String(t.txn_date).slice(0, 10)}</td>
+                    <td className="col-description" title={t.description || ""}>
+                      <span className="txn-description-text">{t.description}</span>
+                    </td>
                     <td>
                       <span className={t.type === "income" ? "txn-amount-income" : "txn-amount-expense"}>
                         {formatAmount(t.amount, t.type)}
@@ -719,7 +1148,7 @@ export default function TransactionsPage() {
                     <td>{t.is_one_time === false ? "No" : "Yes"}</td>
                   </>
                 )}
-                <td>
+                <td className="transaction-cleared-cell">
                   {t.is_projected_recurring ? (
                     <span className="status-chip status-chip-open">Projected</span>
                   ) : (
@@ -747,25 +1176,46 @@ export default function TransactionsPage() {
                   )}
                 </td>
                 <td className="inline-actions">
+                  {renderOrderControls(t)}
                   {t.is_projected_recurring ? (
-                    <button
-                      type="button"
-                      disabled={!t.recurring_rule_id}
-                      onClick={() => {
-                        setModificationTarget(
-                          modificationTarget?.rowId === t.id ? null : {
+                    <>
+                      <button
+                        type="button"
+                        disabled={!t.recurring_rule_id}
+                        onClick={() => {
+                          setModificationTarget(
+                            modificationTarget?.rowId === t.id ? null : {
+                              rowId: t.id,
+                              recurring_rule_id: t.recurring_rule_id,
+                              txn_date: String(t.txn_date).slice(0, 10),
+                              occurrence_anchor_date: getProjectedOccurrenceAnchor(t),
+                              description: t.description,
+                              amount: Number(t.amount || 0)
+                            }
+                          );
+                        }}
+                      >
+                        {modificationTarget?.rowId === t.id ? "Close" : "Modify"}
+                      </button>
+                      <button
+                        type="button"
+                        className="danger"
+                        disabled={!t.recurring_rule_id || skippingOccurrenceKeys[getOccurrenceKeyFromRow(t)]}
+                        onClick={() => {
+                          const occurrenceAnchorDate = getProjectedOccurrenceAnchor(t);
+                          const msg = `Skip this recurring occurrence on ${occurrenceAnchorDate}?`;
+                          if (!window.confirm(msg)) return;
+                          skipOccurrenceM.mutate({
                             rowId: t.id,
                             recurring_rule_id: t.recurring_rule_id,
                             txn_date: String(t.txn_date).slice(0, 10),
-                            occurrence_anchor_date: getProjectedOccurrenceAnchor(t),
-                            description: t.description,
-                            amount: Number(t.amount || 0)
-                          }
-                        );
-                      }}
-                    >
-                      {modificationTarget?.rowId === t.id ? "Close" : "Modify"}
-                    </button>
+                            occurrence_anchor_date: occurrenceAnchorDate
+                          });
+                        }}
+                      >
+                        {skippingOccurrenceKeys[getOccurrenceKeyFromRow(t)] ? "Skipping..." : "Skip"}
+                      </button>
+                    </>
                   ) : editingRows[t.id] ? (
                     <>
                       <button type="button" onClick={() => saveEdit(t)}>Save</button>
@@ -823,7 +1273,7 @@ export default function TransactionsPage() {
       </div>
 
       <div className="transaction-cards">
-        {mergedTransactions.map((t) => (
+        {visibleTransactions.map((t) => (
           <div key={`card-${t.id}`} className={`transaction-card ${!t.is_projected_recurring && t.cleared ? "transaction-card-cleared" : ""}`}>
             <div className="transaction-card-top">
               <span className="transaction-card-date">{String(t.txn_date).slice(0, 10)}</span>
@@ -873,25 +1323,46 @@ export default function TransactionsPage() {
               </span>
             </div>
             <div className="transaction-card-actions">
+              {renderOrderControls(t)}
               {t.is_projected_recurring ? (
-                <button
-                  type="button"
-                  disabled={!t.recurring_rule_id}
-                  onClick={() => {
-                    setModificationTarget(
-                      modificationTarget?.rowId === t.id ? null : {
+                <>
+                  <button
+                    type="button"
+                    disabled={!t.recurring_rule_id}
+                    onClick={() => {
+                      setModificationTarget(
+                        modificationTarget?.rowId === t.id ? null : {
+                          rowId: t.id,
+                          recurring_rule_id: t.recurring_rule_id,
+                          txn_date: String(t.txn_date).slice(0, 10),
+                          occurrence_anchor_date: getProjectedOccurrenceAnchor(t),
+                          description: t.description,
+                          amount: Number(t.amount || 0)
+                        }
+                      );
+                    }}
+                  >
+                    {modificationTarget?.rowId === t.id ? "Close" : "Modify"}
+                  </button>
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={!t.recurring_rule_id || skippingOccurrenceKeys[getOccurrenceKeyFromRow(t)]}
+                    onClick={() => {
+                      const occurrenceAnchorDate = getProjectedOccurrenceAnchor(t);
+                      const msg = `Skip this recurring occurrence on ${occurrenceAnchorDate}?`;
+                      if (!window.confirm(msg)) return;
+                      skipOccurrenceM.mutate({
                         rowId: t.id,
                         recurring_rule_id: t.recurring_rule_id,
                         txn_date: String(t.txn_date).slice(0, 10),
-                        occurrence_anchor_date: getProjectedOccurrenceAnchor(t),
-                        description: t.description,
-                        amount: Number(t.amount || 0)
-                      }
-                    );
-                  }}
-                >
-                  {modificationTarget?.rowId === t.id ? "Close" : "Modify"}
-                </button>
+                        occurrence_anchor_date: occurrenceAnchorDate
+                      });
+                    }}
+                  >
+                    {skippingOccurrenceKeys[getOccurrenceKeyFromRow(t)] ? "Skipping..." : "Skip"}
+                  </button>
+                </>
               ) : (
                 <>
                   <button type="button" onClick={() => startEdit(t)}>Edit</button>

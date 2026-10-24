@@ -105,6 +105,9 @@ function parseFilters(filters = {}) {
   if (filters.account_id) push("t.account_id = $?", Number(filters.account_id));
   if (filters.category_id) push("t.category_id = $?", Number(filters.category_id));
   if (typeof filters.cleared === "boolean") push("t.cleared = $?", filters.cleared);
+  if (String(filters.search || "").trim()) {
+    push("POSITION(LOWER($?) IN LOWER(CONCAT_WS(' ', t.description, t.account_name, t.category_name, t.type, t.amount::TEXT))) > 0", String(filters.search).trim());
+  }
 
   return { where, params };
 }
@@ -127,6 +130,7 @@ export async function listTransactions(filters = {}) {
         t.transfer_pair_id,
         t.account_id,
         t.category_id,
+        COALESCE(o.sort_order, 0) AS sort_order,
         a.name AS account_name,
         c.name AS category_name,
         CASE
@@ -134,7 +138,7 @@ export async function listTransactions(filters = {}) {
           ELSE SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END)
             OVER (
               PARTITION BY t.account_id
-              ORDER BY t.txn_date ASC, t.id ASC
+              ORDER BY t.txn_date ASC, COALESCE(o.sort_order, 0) ASC, t.id ASC
               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
             )
         END AS account_total_as_of
@@ -142,6 +146,11 @@ export async function listTransactions(filters = {}) {
       LEFT JOIN accounts a ON a.id = t.account_id
       LEFT JOIN categories c ON c.id = t.category_id
       LEFT JOIN recurring_entries r ON r.id = t.recurring_rule_id
+      LEFT JOIN transaction_order o ON o.transaction_key = CASE
+        WHEN t.recurring_rule_id IS NOT NULL THEN
+          'recurring:' || t.recurring_rule_id || ':' || TO_CHAR(t.txn_date, 'YYYY-MM-DD') || ':' || COALESCE(t.account_id, 0)
+        ELSE 'transaction:' || t.id
+      END
       WHERE (
         t.recurring_rule_id IS NULL
         OR r.id IS NULL
@@ -151,7 +160,7 @@ export async function listTransactions(filters = {}) {
     SELECT *
     FROM enriched t
     ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-    ORDER BY t.txn_date DESC, t.id DESC
+    ORDER BY t.txn_date DESC, t.sort_order DESC, t.id DESC
   `;
   const { rows } = await query(sql, params);
   return rows;
@@ -258,7 +267,7 @@ export async function updateTransaction(id, input) {
   ensureClearedRule(input.txn_date, input.cleared);
 
   const { rows: existingRows } = await query(
-    "SELECT id, transfer_pair_id, type, account_id FROM transactions WHERE id = $1",
+    "SELECT id, txn_date, cleared, is_one_time, recurring_rule_id, transfer_pair_id, type, account_id FROM transactions WHERE id = $1",
     [id]
   );
   const existing = existingRows[0];
@@ -342,10 +351,13 @@ export async function updateTransaction(id, input) {
       const updateSql = `
         UPDATE transactions
         SET txn_date = $1, description = $2, amount = $3, type = $4, cleared = $5,
-            account_id = $6, category_id = NULL, is_one_time = true, recurring_rule_id = NULL
-        WHERE id = $7
+            account_id = $6, category_id = $7, is_one_time = true, recurring_rule_id = NULL
+        WHERE id = $8
         RETURNING *
       `;
+
+      const parsedCategoryId = Number(input.category_id);
+      const categoryId = Number.isInteger(parsedCategoryId) && parsedCategoryId > 0 ? parsedCategoryId : null;
 
       const { rows: updatedOutgoingRows } = await client.query(updateSql, [
         txnDate,
@@ -354,6 +366,7 @@ export async function updateTransaction(id, input) {
         "expense",
         cleared,
         fromAccountId,
+        categoryId,
         outgoingRow.id
       ]);
 
@@ -364,6 +377,7 @@ export async function updateTransaction(id, input) {
         "income",
         cleared,
         toAccountId,
+        categoryId,
         incomingRow.id
       ]);
 
@@ -377,6 +391,47 @@ export async function updateTransaction(id, input) {
     } finally {
       client.release();
     }
+  }
+
+  // When the date of an uncleared materialized recurring transaction changes, detach it
+  // from the schedule so the materialization engine doesn't revert the edit. We also
+  // create an is_deleted modification for the original scheduled date so that the
+  // materialization does not re-create the old occurrence.
+  let effectiveIsOneTime = input.is_one_time !== false;
+  const newTxnDate = normalizeIsoDate(input.txn_date);
+  const oldTxnDate = normalizeIsoDate(existing.txn_date);
+  if (
+    existing.recurring_rule_id &&
+    existing.is_one_time === false &&
+    !Boolean(existing.cleared) &&
+    newTxnDate &&
+    newTxnDate !== oldTxnDate
+  ) {
+    effectiveIsOneTime = true;
+
+    // Find the canonical scheduled date for this occurrence. If a one_time modification
+    // moved the occurrence to the current txn_date via override_txn_date, the scheduled
+    // date is that modification's start_date; otherwise it is the txn_date itself.
+    const modResult = await query(
+      `SELECT start_date FROM recurring_modifications
+       WHERE recurring_rule_id = $1
+         AND modification_type = 'one_time'
+         AND override_txn_date::date = $2::date
+         AND is_deleted = false
+       ORDER BY id DESC LIMIT 1`,
+      [existing.recurring_rule_id, oldTxnDate]
+    );
+    const scheduledDate = modResult.rows[0]
+      ? normalizeIsoDate(modResult.rows[0].start_date)
+      : oldTxnDate;
+
+    // Mark the original scheduled occurrence as deleted so the materialization skips it.
+    await query(
+      `INSERT INTO recurring_modifications
+         (recurring_rule_id, modification_type, start_date, is_deleted)
+       VALUES ($1, 'one_time', $2, true)`,
+      [existing.recurring_rule_id, scheduledDate]
+    );
   }
 
   const sql = `
@@ -394,7 +449,7 @@ export async function updateTransaction(id, input) {
     Boolean(input.cleared),
     input.account_id || null,
     input.category_id || null,
-    input.is_one_time !== false,
+    effectiveIsOneTime,
     input.recurring_rule_id || null,
     id
   ];
@@ -403,7 +458,10 @@ export async function updateTransaction(id, input) {
 }
 
 export async function deleteTransaction(id) {
-  const { rows: existing } = await query("SELECT id, cleared, transfer_pair_id FROM transactions WHERE id = $1", [id]);
+  const { rows: existing } = await query(
+    "SELECT id, txn_date, cleared, transfer_pair_id, recurring_rule_id, is_one_time FROM transactions WHERE id = $1",
+    [id]
+  );
   if (existing.length === 0) return false;
   
   const transaction = existing[0];
@@ -415,14 +473,145 @@ export async function deleteTransaction(id) {
   
   const pairId = transaction.transfer_pair_id;
   if (pairId) {
-    const { rows: pairRows } = await query("SELECT id, cleared FROM transactions WHERE transfer_pair_id = $1", [pairId]);
+    const { rows: pairRows } = await query(
+      "SELECT id, txn_date, cleared, recurring_rule_id, is_one_time FROM transactions WHERE transfer_pair_id = $1",
+      [pairId]
+    );
     if (pairRows.some((row) => Boolean(row.cleared))) {
       const err = new Error("Cannot delete a transfer with a cleared transaction.");
       err.status = 400;
       throw err;
     }
+
+    const generatedRecurringLeg = pairRows.find((row) => Boolean(row.recurring_rule_id) && row.is_one_time === false);
+    if (generatedRecurringLeg) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        const recurringRuleId = Number(generatedRecurringLeg.recurring_rule_id);
+        const occurrenceDate = normalizeIsoDate(generatedRecurringLeg.txn_date);
+        const anchorLookupSql = `
+          SELECT start_date
+          FROM recurring_modifications
+          WHERE recurring_rule_id = $1
+            AND modification_type = 'one_time'
+            AND (start_date = $2 OR override_txn_date = $2)
+          ORDER BY
+            CASE
+              WHEN override_txn_date = $2 AND COALESCE(is_deleted, false) = false THEN 0
+              WHEN override_txn_date = $2 THEN 1
+              WHEN start_date = $2 AND COALESCE(is_deleted, false) = false THEN 2
+              WHEN start_date = $2 THEN 3
+              ELSE 4
+            END,
+            id DESC
+          LIMIT 1
+        `;
+        const anchorLookup = await client.query(anchorLookupSql, [recurringRuleId, occurrenceDate]);
+        const anchorStartDate = normalizeIsoDate(anchorLookup.rows?.[0]?.start_date) || occurrenceDate;
+
+        const updateExistingSkipSql = `
+          UPDATE recurring_modifications
+          SET is_deleted = true,
+              amount = NULL,
+              description = NULL,
+              account_id = NULL,
+              category_id = NULL,
+              override_txn_date = NULL,
+              end_date = NULL
+          WHERE recurring_rule_id = $1
+            AND modification_type = 'one_time'
+            AND start_date = $2
+        `;
+        const updateResult = await client.query(updateExistingSkipSql, [recurringRuleId, anchorStartDate]);
+        if (Number(updateResult.rowCount || 0) === 0) {
+          await client.query(
+            `
+              INSERT INTO recurring_modifications
+                (recurring_rule_id, modification_type, start_date, end_date, amount, description, account_id, category_id, override_txn_date, is_deleted)
+              VALUES ($1, 'one_time', $2, NULL, NULL, NULL, NULL, NULL, NULL, true)
+            `,
+            [recurringRuleId, anchorStartDate]
+          );
+        }
+
+        const { rowCount } = await client.query("DELETE FROM transactions WHERE transfer_pair_id = $1", [pairId]);
+        await client.query("COMMIT");
+        return rowCount > 0;
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+
     const { rowCount } = await query("DELETE FROM transactions WHERE transfer_pair_id = $1", [pairId]);
     return rowCount > 0;
+  }
+
+  const isGeneratedRecurring = Boolean(transaction.recurring_rule_id) && transaction.is_one_time === false;
+  if (isGeneratedRecurring) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const recurringRuleId = Number(transaction.recurring_rule_id);
+      const occurrenceDate = normalizeIsoDate(transaction.txn_date);
+      const anchorLookupSql = `
+        SELECT start_date
+        FROM recurring_modifications
+        WHERE recurring_rule_id = $1
+          AND modification_type = 'one_time'
+          AND (start_date = $2 OR override_txn_date = $2)
+        ORDER BY
+          CASE
+            WHEN override_txn_date = $2 AND COALESCE(is_deleted, false) = false THEN 0
+            WHEN override_txn_date = $2 THEN 1
+            WHEN start_date = $2 AND COALESCE(is_deleted, false) = false THEN 2
+            WHEN start_date = $2 THEN 3
+            ELSE 4
+          END,
+          id DESC
+        LIMIT 1
+      `;
+      const anchorLookup = await client.query(anchorLookupSql, [recurringRuleId, occurrenceDate]);
+      const anchorStartDate = normalizeIsoDate(anchorLookup.rows?.[0]?.start_date) || occurrenceDate;
+
+      const updateExistingSkipSql = `
+        UPDATE recurring_modifications
+        SET is_deleted = true,
+            amount = NULL,
+            description = NULL,
+            account_id = NULL,
+            category_id = NULL,
+            override_txn_date = NULL,
+            end_date = NULL
+        WHERE recurring_rule_id = $1
+          AND modification_type = 'one_time'
+          AND start_date = $2
+      `;
+      const updateResult = await client.query(updateExistingSkipSql, [recurringRuleId, anchorStartDate]);
+
+      if (Number(updateResult.rowCount || 0) === 0) {
+        const insertSkipSql = `
+          INSERT INTO recurring_modifications
+            (recurring_rule_id, modification_type, start_date, end_date, amount, description, account_id, category_id, override_txn_date, is_deleted)
+          VALUES ($1, 'one_time', $2, NULL, NULL, NULL, NULL, NULL, NULL, true)
+        `;
+        await client.query(insertSkipSql, [recurringRuleId, anchorStartDate]);
+      }
+
+      const { rowCount } = await client.query("DELETE FROM transactions WHERE id = $1", [id]);
+      await client.query("COMMIT");
+      return rowCount > 0;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
   
   const { rowCount } = await query("DELETE FROM transactions WHERE id = $1", [id]);

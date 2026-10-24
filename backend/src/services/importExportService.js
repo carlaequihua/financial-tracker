@@ -282,6 +282,7 @@ export async function clearAllData() {
     await query(
       `
       TRUNCATE TABLE
+        transaction_order,
         transactions,
         recurring_entries,
         budgets,
@@ -301,7 +302,7 @@ export async function clearAllData() {
 export async function clearAllTransactions() {
   await query("BEGIN");
   try {
-    await query("TRUNCATE TABLE transactions RESTART IDENTITY CASCADE");
+    await query("TRUNCATE TABLE transaction_order, transactions RESTART IDENTITY CASCADE");
     await query("COMMIT");
     return { ok: true };
   } catch (error) {

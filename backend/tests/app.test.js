@@ -18,7 +18,13 @@ vi.mock("../src/services/importExportService.js", () => ({
   clearAllTransactions: vi.fn(async () => ({ ok: true }))
 }));
 
+vi.mock("../src/services/transactionOrderService.js", () => ({
+  reorderTransaction: vi.fn(async () => ({ ok: true }))
+}));
+
 import { createApp } from "../src/app.js";
+import { listTransactions } from "../src/services/transactionsService.js";
+import { reorderTransaction } from "../src/services/transactionOrderService.js";
 
 describe("API smoke tests", () => {
   const app = createApp();
@@ -52,6 +58,19 @@ describe("API smoke tests", () => {
     const res = await request(app).post("/api/transactions").send(payload);
     expect(res.status).toBe(201);
     expect(res.body.description).toBe("Coffee");
+  });
+
+  it("passes search and account filters together to the transaction service", async () => {
+    const res = await request(app).get("/api/transactions?search=coffee&account_id=2");
+    expect(res.status).toBe(200);
+    expect(listTransactions).toHaveBeenLastCalledWith(expect.objectContaining({ search: "coffee", account_id: "2" }));
+  });
+
+  it("PATCH /api/transactions/order passes the requested move to the service", async () => {
+    const payload = { date: "2026-11-01", key: "transaction:2", target_key: "transaction:1", placement: "before" };
+    const res = await request(app).patch("/api/transactions/order").send(payload);
+    expect(res.status).toBe(200);
+    expect(reorderTransaction).toHaveBeenLastCalledWith(payload);
   });
 
   it("PATCH /api/transactions/:id/cleared", async () => {

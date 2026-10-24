@@ -21,6 +21,8 @@ const initialForm = {
   end_date: "",
   account_id: "",
   category_id: "",
+  from_account_id: "",
+  to_account_id: "",
   active: true
 };
 
@@ -76,6 +78,8 @@ export default function RecurringPage() {
       end_date: input.has_end_date ? (input.end_date || null) : null,
       account_id: input.account_id ? Number(input.account_id) : null,
       category_id: input.category_id ? Number(input.category_id) : null,
+      from_account_id: input.type === "transfer" ? Number(input.from_account_id) : null,
+      to_account_id: input.type === "transfer" ? Number(input.to_account_id) : null,
       active: Boolean(input.active)
     };
   }
@@ -105,6 +109,8 @@ export default function RecurringPage() {
       end_date: row.end_date ? String(row.end_date).slice(0, 10) : "",
       account_id: row.account_id ? String(row.account_id) : "",
       category_id: row.category_id ? String(row.category_id) : "",
+      from_account_id: row.from_account_id ? String(row.from_account_id) : "",
+      to_account_id: row.to_account_id ? String(row.to_account_id) : "",
       active: row.active !== false
     });
   }
@@ -150,7 +156,11 @@ export default function RecurringPage() {
                       {r.type}
                     </span>
                   </td>
-                  <td>{r.account_name || "-"}</td>
+                  <td>
+                    {r.type === "transfer"
+                      ? `${r.from_account_name || r.from_account_id || "-"} -> ${r.to_account_name || r.to_account_id || "-"}`
+                      : (r.account_name || "-")}
+                  </td>
                   <td>{r.cadence}</td>
                   <td>{String(r.start_date).slice(0, 10)}</td>
                   <td>{r.end_date ? String(r.end_date).slice(0, 10) : "Never"}</td>
@@ -189,6 +199,7 @@ export default function RecurringPage() {
             <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}>
               <option value="expense">Expense</option>
               <option value="income">Income</option>
+              <option value="transfer">Transfer</option>
             </select>
             <select value={form.cadence} onChange={(e) => setForm({ ...form, cadence: e.target.value })}>
               <option value="daily">Daily</option>
@@ -233,14 +244,39 @@ export default function RecurringPage() {
             {form.has_end_date ? (
               <input type="date" value={form.end_date} onChange={(e) => setForm({ ...form, end_date: e.target.value })} />
             ) : null}
-            <select value={form.account_id} onChange={(e) => setForm({ ...form, account_id: e.target.value })}>
-              <option value="">No account</option>
-              {(accounts.data || []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
-            </select>
-            <select value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}>
-              <option value="">No category</option>
-              {(categories.data || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-            </select>
+            {form.type === "transfer" ? (
+              <>
+                <label className="inline-filter">
+                  <span>From account</span>
+                  <select value={form.from_account_id} onChange={(e) => setForm({ ...form, from_account_id: e.target.value })}>
+                    <option value="">Select source account</option>
+                    {(accounts.data || []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                  </select>
+                </label>
+                <label className="inline-filter">
+                  <span>To account</span>
+                  <select value={form.to_account_id} onChange={(e) => setForm({ ...form, to_account_id: e.target.value })}>
+                    <option value="">Select destination account</option>
+                    {(accounts.data || []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                  </select>
+                </label>
+                <select value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}>
+                  <option value="">No category</option>
+                  {(categories.data || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              </>
+            ) : (
+              <>
+                <select value={form.account_id} onChange={(e) => setForm({ ...form, account_id: e.target.value })}>
+                  <option value="">No account</option>
+                  {(accounts.data || []).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+                <select value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}>
+                  <option value="">No category</option>
+                  {(categories.data || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              </>
+            )}
             <label className="checkbox-row">
               <input
                 type="checkbox"

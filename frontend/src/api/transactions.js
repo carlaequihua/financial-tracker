@@ -7,7 +7,8 @@ export function normalizeTransactionFilters(filters = {}) {
     account_id: filters.account_id || "",
     category_id: filters.category_id || "",
     type: filters.type || "",
-    cleared: filters.cleared || ""
+    cleared: filters.cleared || "",
+    search: String(filters.search || "").trim()
   };
 }
 
@@ -26,5 +27,6 @@ export const transactionsApi = {
   create: (payload) => api.post("/api/transactions", payload),
   update: (id, payload) => api.put(`/api/transactions/${id}`, payload),
   setCleared: (id, cleared) => api.patch(`/api/transactions/${id}/cleared`, { cleared }),
+  reorder: (payload) => api.patch("/api/transactions/order", payload),
   remove: (id) => api.del(`/api/transactions/${id}`)
 };

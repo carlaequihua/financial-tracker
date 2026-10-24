@@ -1,4 +1,6 @@
 import { query } from "../db/query.js";
+import { attachTransactionOrder } from "./transactionOrderLookup.js";
+import { matchesTransactionSearch } from "../../../shared/transactionList.js";
 
 function addByCadence(date, cadence) {
   const next = new Date(date);
@@ -84,6 +86,65 @@ function applyModification(row, modification, dueDate) {
   return modified;
 }
 
+function buildTransferProjectedRows(row, dueDate, modification) {
+  const dueDateStr = toIsoDate(dueDate);
+  const baseRow = {
+    recurring_rule_id: row.id,
+    txn_date: dueDateStr,
+    amount: getEffectiveAmount(row, dueDate),
+    cadence: row.cadence,
+    cleared: false,
+    is_one_time: false,
+    projected: true
+  };
+  const mod = modification;
+  const overrideTxnDate = mod ? normalizeDate(mod.override_txn_date) : null;
+  const effectiveDate = mod && mod.modification_type === "one_time" && overrideTxnDate ? overrideTxnDate : dueDateStr;
+  const effectiveAmount = mod && mod.amount !== null && mod.amount !== undefined
+    ? Number(mod.amount)
+    : baseRow.amount;
+  const description = mod && mod.description ? mod.description : row.name;
+  const categoryId = mod && mod.category_id !== null && mod.category_id !== undefined ? mod.category_id : row.category_id;
+  const categoryName = mod && mod.category_id !== null && mod.category_id !== undefined ? mod.category_name : row.category_name;
+
+  return [
+    {
+      id: `projected-${row.id}-${effectiveDate}-out`,
+      transfer_pair_id: `projected-transfer-${row.id}-${effectiveDate}`,
+      txn_date: effectiveDate,
+      description: `${description} (Transfer to ${row.to_account_name || row.to_account_id})`,
+      amount: effectiveAmount,
+      type: "expense",
+      cadence: row.cadence,
+      account_id: row.from_account_id,
+      category_id: categoryId,
+      account_name: row.from_account_name,
+      category_name: categoryName,
+      cleared: false,
+      is_one_time: false,
+      projected: true,
+      recurring_rule_id: row.id
+    },
+    {
+      id: `projected-${row.id}-${effectiveDate}-in`,
+      transfer_pair_id: `projected-transfer-${row.id}-${effectiveDate}`,
+      txn_date: effectiveDate,
+      description: `${description} (Transfer from ${row.from_account_name || row.from_account_id})`,
+      amount: effectiveAmount,
+      type: "income",
+      cadence: row.cadence,
+      account_id: row.to_account_id,
+      category_id: categoryId,
+      account_name: row.to_account_name,
+      category_name: categoryName,
+      cleared: false,
+      is_one_time: false,
+      projected: true,
+      recurring_rule_id: row.id
+    }
+  ];
+}
+
 function getApplicableModification(modifications, dueDate, dueDateStr) {
   if (!modifications || modifications.length === 0) return null;
   const normalizedDueDate = toIsoDate(dueDate);
@@ -142,6 +203,9 @@ function pushProjectedRow(result, row, dueDate, modifications = []) {
   };
   const mod = getApplicableModification(modifications, dueDate, dueDateStr);
   if (mod) {
+    if (Boolean(mod.is_deleted)) {
+      return;
+    }
     const overrideTxnDate = normalizeDate(mod.override_txn_date);
     if (mod.modification_type === "one_time" && overrideTxnDate) {
       projectedRow.txn_date = overrideTxnDate;
@@ -154,9 +218,11 @@ function pushProjectedRow(result, row, dueDate, modifications = []) {
     }
     if (mod.account_id !== null && mod.account_id !== undefined) {
       projectedRow.account_id = mod.account_id;
+      projectedRow.account_name = mod.account_name || null;
     }
     if (mod.category_id !== null && mod.category_id !== undefined) {
       projectedRow.category_id = mod.category_id;
+      projectedRow.category_name = mod.category_name || null;
     }
   }
   result.push(projectedRow);
@@ -184,7 +250,14 @@ function addSemiweeklyOccurrences(result, row, rangeStart, rangeEnd, endDate, mo
       if (candidate < startDate) continue;
       if (endDate && candidate > endDate) continue;
       if (!withinRange(candidate, rangeStart, rangeEnd)) continue;
-      pushProjectedRow(result, row, candidate, modifications);
+      if (row.type === "transfer") {
+        const mod = getApplicableModification(modifications, candidate, toIsoDate(candidate));
+        if (!mod || !Boolean(mod.is_deleted)) {
+          result.push(...buildTransferProjectedRows(row, candidate, mod));
+        }
+      } else {
+        pushProjectedRow(result, row, candidate, modifications);
+      }
     }
     monthCursor.setMonth(monthCursor.getMonth() + 1);
   }
@@ -216,6 +289,10 @@ export async function getProjectedTransactions(filters = {}) {
       r.end_date,
       r.account_id,
       r.category_id,
+      r.from_account_id,
+      r.to_account_id,
+      af.name AS from_account_name,
+      at.name AS to_account_name,
       r.future_amount,
       r.future_amount_start_date,
       r.semi_month_day_1,
@@ -225,6 +302,8 @@ export async function getProjectedTransactions(filters = {}) {
     FROM recurring_entries r
     LEFT JOIN accounts a ON a.id = r.account_id
     LEFT JOIN categories c ON c.id = r.category_id
+    LEFT JOIN accounts af ON af.id = r.from_account_id
+    LEFT JOIN accounts at ON at.id = r.to_account_id
     WHERE r.active = true
       AND (r.end_date IS NULL OR r.end_date >= $1)
       AND r.start_date <= $2
@@ -232,10 +311,12 @@ export async function getProjectedTransactions(filters = {}) {
   const { rows } = await query(sql, [toIsoDate(projectionStart), toIsoDate(high)]);
 
   const modSql = `
-    SELECT *
-    FROM recurring_modifications
-    WHERE recurring_rule_id = ANY($1::INT[])
-    ORDER BY start_date ASC
+    SELECT m.*, a.name AS account_name, c.name AS category_name
+    FROM recurring_modifications m
+    LEFT JOIN accounts a ON a.id = m.account_id
+    LEFT JOIN categories c ON c.id = m.category_id
+    WHERE m.recurring_rule_id = ANY($1::INT[])
+    ORDER BY m.start_date ASC
   `;
   const recurringIds = rows.map((r) => r.id);
   const modResult = recurringIds.length > 0 ? await query(modSql, [recurringIds]) : { rows: [] };
@@ -247,15 +328,8 @@ export async function getProjectedTransactions(filters = {}) {
     modsByRuleId[mod.recurring_rule_id].push(mod);
   }
 
-  const filtered = rows.filter((row) => {
-    if (filters.type && row.type !== filters.type) return false;
-    if (filters.account_id && Number(row.account_id || 0) !== Number(filters.account_id)) return false;
-    if (filters.category_id && Number(row.category_id || 0) !== Number(filters.category_id)) return false;
-    return true;
-  });
-
   const result = [];
-  for (const row of filtered) {
+  for (const row of rows) {
     const startDate = toDateOnly(row.start_date);
     const endDate = parseOptionalDate(row.end_date);
     const mods = modsByRuleId[row.id] || [];
@@ -273,14 +347,53 @@ export async function getProjectedTransactions(filters = {}) {
 
     while (candidate <= high && (!endDate || candidate <= endDate)) {
       if (candidate >= projectionStart) {
-        pushProjectedRow(result, row, candidate, mods);
+        if (row.type === "transfer") {
+          const mod = getApplicableModification(mods, candidate, toIsoDate(candidate));
+          if (!mod || !Boolean(mod.is_deleted)) {
+            const transferRows = buildTransferProjectedRows(row, candidate, mod);
+            result.push(...transferRows);
+          }
+        } else {
+          pushProjectedRow(result, row, candidate, mods);
+        }
       }
       candidate = addByCadence(candidate, row.cadence);
     }
   }
 
-  result.sort((a, b) => a.txn_date.localeCompare(b.txn_date) || String(a.id).localeCompare(String(b.id)));
-  return result;
+  const filteredResult = result.filter((row) =>
+    (!filters.account_id || Number(row.account_id || 0) === Number(filters.account_id)) &&
+    (!filters.category_id || Number(row.category_id || 0) === Number(filters.category_id)) &&
+    (!filters.type || row.type === filters.type)
+  );
+
+  // If an occurrence already exists as a real transaction, do not return
+  // a projected duplicate for the same recurring rule and txn_date.
+  // We query by the exact txn_dates present in the projected result rather than
+  // a date range, so that override_txn_date values in the past are also checked
+  // without accidentally suppressing unrelated projected rows.
+  if (filteredResult.length > 0 && recurringIds.length > 0) {
+    const projectedDates = [...new Set(filteredResult.map((row) => normalizeDate(row.txn_date)).filter(Boolean))];
+    const existingSql = `
+      SELECT recurring_rule_id, txn_date
+      FROM transactions
+      WHERE recurring_rule_id = ANY($1::INT[])
+        AND txn_date = ANY($2::DATE[])
+    `;
+    const existingResult = await query(existingSql, [recurringIds, projectedDates]);
+    const existingKeys = new Set(
+      existingResult.rows.map((row) => `${row.recurring_rule_id}|${normalizeDate(row.txn_date)}`)
+    );
+    const deduped = filteredResult.filter((row) => {
+      const key = `${row.recurring_rule_id}|${normalizeDate(row.txn_date)}`;
+      return !existingKeys.has(key);
+    });
+    deduped.sort((a, b) => a.txn_date.localeCompare(b.txn_date) || String(a.id).localeCompare(String(b.id)));
+    return attachTransactionOrder(deduped.filter((row) => matchesTransactionSearch(row, filters.search)));
+  }
+
+  filteredResult.sort((a, b) => a.txn_date.localeCompare(b.txn_date) || String(a.id).localeCompare(String(b.id)));
+  return attachTransactionOrder(filteredResult.filter((row) => matchesTransactionSearch(row, filters.search)));
 }
 
 export async function getUpcomingExpenses(days = 30) {

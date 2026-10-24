@@ -23,6 +23,11 @@ export default function MasterDataPage() {
   const categories = useMemo(() => summary.data?.categories || [], [summary.data]);
   const categoryTotals = useMemo(() => summary.data?.categoryTotals || [], [summary.data]);
   const monthlyTotals = useMemo(() => summary.data?.monthlyTotals || [], [summary.data]);
+  const categoryExpenseShare = useMemo(() => {
+    return categoryTotals
+      .filter((row) => Number(row.current_month_spent || 0) > 0)
+      .sort((a, b) => Number(b.current_month_spent || 0) - Number(a.current_month_spent || 0));
+  }, [categoryTotals]);
 
   const addAccount = useMutation({
     mutationFn: masterDataApi.addAccount,
@@ -215,6 +220,32 @@ export default function MasterDataPage() {
                 </div>
               )}
             </div>
+            <div className="category-share-wrap">
+              <h3 className="section-subtitle">This Month Expense Share by Category</h3>
+              {categoryExpenseShare.length === 0 ? (
+                <p className="status status-empty">No expense transactions in the current month yet.</p>
+              ) : (
+                <div className="category-share-list">
+                  {categoryExpenseShare.map((row) => {
+                    const pct = Number(row.current_month_expense_pct || 0);
+                    const spent = Number(row.current_month_spent || 0);
+                    return (
+                      <div key={row.id ?? "other"} className="category-share-row">
+                        <div className="category-share-row-head">
+                          <span>{row.name || "Other"}</span>
+                          <span>
+                            {pct.toFixed(2)}% ({formatBalance(-spent)})
+                          </span>
+                        </div>
+                        <div className="category-share-bar-track" aria-hidden="true">
+                          <div className="category-share-bar-fill" style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </>
         ) : null}
       </SimpleCard>
@@ -343,7 +374,7 @@ export default function MasterDataPage() {
                 </>
               ) : (
                 <>
-                  <span>{c.name}</span>
+                  <span>{c.name || "Other"}</span>
                   <span className="txn-amount-expense">{Number(c.total_spent || 0) > 0 ? formatBalance(-Number(c.total_spent)) : "—"}</span>
                   <span className="txn-amount-income">{Number(c.total_income || 0) > 0 ? formatBalance(Number(c.total_income)) : "—"}</span>
                   <span className="summary-row-actions">

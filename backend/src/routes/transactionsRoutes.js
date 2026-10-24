@@ -7,6 +7,7 @@ import {
   setTransactionCleared
 } from "../services/transactionsService.js";
 import { getProjectedTransactions } from "../services/analyticsService.js";
+import { reorderTransaction } from "../services/transactionOrderService.js";
 
 const router = Router();
 
@@ -18,6 +19,7 @@ router.get("/", async (req, res, next) => {
       type: req.query.type,
       account_id: req.query.account_id,
       category_id: req.query.category_id,
+      search: req.query.search,
       cleared: req.query.cleared === undefined ? undefined : req.query.cleared === "true"
     };
     res.json(await listTransactions(filters));
@@ -33,11 +35,20 @@ router.get("/projected", async (req, res, next) => {
       to: req.query.to,
       type: req.query.type,
       account_id: req.query.account_id,
-      category_id: req.query.category_id
+      category_id: req.query.category_id,
+      search: req.query.search
     };
     res.json(await getProjectedTransactions(filters));
   } catch (e) {
     next(e);
+  }
+});
+
+router.patch("/order", async (req, res, next) => {
+  try {
+    res.json(await reorderTransaction(req.body));
+  } catch (error) {
+    next(error);
   }
 });
 

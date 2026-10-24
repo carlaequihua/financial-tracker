@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { query } from "../db/query.js";
 
 function toIsoDate(value) {
@@ -129,6 +130,24 @@ function buildOccurrencePayload(row, dueDate, modification) {
   return payload;
 }
 
+function buildTransferOccurrencePayload(row, dueDate, modification) {
+  const payload = buildOccurrencePayload(row, dueDate, modification);
+  return {
+    ...payload,
+    type: "transfer",
+    from_account_id: row.from_account_id,
+    to_account_id: row.to_account_id
+  };
+}
+
+function buildTransferLegDescriptions(baseDescription, fromAccountName, toAccountName) {
+  const normalized = String(baseDescription || "Transfer").trim() || "Transfer";
+  return {
+    outgoingDescription: `${normalized} (Transfer to ${toAccountName})`,
+    incomingDescription: `${normalized} (Transfer from ${fromAccountName})`
+  };
+}
+
 function enumerateScheduledDates(row, cutoffDate) {
   const startDate = toDateOnly(row.start_date);
   const endDate = row.end_date ? toDateOnly(row.end_date) : null;
@@ -172,16 +191,46 @@ function enumerateScheduledDates(row, cutoffDate) {
   return result;
 }
 
+// Returns scheduled dates that are BEYOND cutoffIso but whose one_time override_txn_date
+// falls on or before cutoffIso. These occurrences need to be materialized even though
+// their canonical scheduled date hasn't arrived yet.
+function getEarlyOverrideScheduledDates(modifications, cutoffIso) {
+  const extra = [];
+  for (const mod of modifications) {
+    if (
+      mod.modification_type === "one_time" &&
+      mod.override_txn_date &&
+      !Boolean(mod.is_deleted)
+    ) {
+      const overrideDate = normalizeDate(mod.override_txn_date);
+      const schedDate = normalizeDate(mod.start_date);
+      if (overrideDate && schedDate && overrideDate <= cutoffIso && schedDate > cutoffIso) {
+        extra.push(toDateOnly(schedDate));
+      }
+    }
+  }
+  return extra;
+}
+
 function buildValidTxnDateSet(row, cutoffDate, modifications = []) {
+  const cutoffIso = toIsoDate(cutoffDate);
   const validDates = new Set();
-  const scheduledDates = enumerateScheduledDates(row, cutoffDate);
+  const scheduledDates = [
+    ...enumerateScheduledDates(row, cutoffDate),
+    ...getEarlyOverrideScheduledDates(modifications, cutoffIso)
+  ];
 
   for (const dueDate of scheduledDates) {
     const mod = getApplicableModification(modifications, dueDate);
-    const payload = buildOccurrencePayload(row, dueDate, mod);
+    if (mod && Boolean(mod.is_deleted)) {
+      continue;
+    }
+    const payload = row.type === "transfer"
+      ? buildTransferOccurrencePayload(row, dueDate, mod)
+      : buildOccurrencePayload(row, dueDate, mod);
     const txnDate = normalizeDate(payload.txn_date);
     if (!txnDate) continue;
-    if (txnDate > toIsoDate(cutoffDate)) continue;
+    if (txnDate > cutoffIso) continue;
     validDates.add(txnDate);
   }
 
@@ -208,23 +257,29 @@ export async function materializeDueRecurringTransactions({ cutoffDate } = {}) {
 
   const recurringSql = `
     SELECT
-      id,
-      name,
-      amount,
-      type,
-      cadence,
-      start_date,
-      end_date,
-      account_id,
-      category_id,
-      future_amount,
-      future_amount_start_date,
-      semi_month_day_1,
-      semi_month_day_2
+      recurring_entries.id,
+      recurring_entries.name,
+      recurring_entries.amount,
+      recurring_entries.type,
+      recurring_entries.cadence,
+      recurring_entries.start_date,
+      recurring_entries.end_date,
+      recurring_entries.account_id,
+      recurring_entries.category_id,
+      recurring_entries.from_account_id,
+      recurring_entries.to_account_id,
+      af.name AS from_account_name,
+      at.name AS to_account_name,
+      recurring_entries.future_amount,
+      recurring_entries.future_amount_start_date,
+      recurring_entries.semi_month_day_1,
+      recurring_entries.semi_month_day_2
     FROM recurring_entries
-    WHERE active = true
-      AND start_date <= $1
-      AND (end_date IS NULL OR end_date >= start_date)
+    LEFT JOIN accounts af ON af.id = recurring_entries.from_account_id
+    LEFT JOIN accounts at ON at.id = recurring_entries.to_account_id
+    WHERE recurring_entries.active = true
+      AND recurring_entries.start_date <= $1
+      AND (recurring_entries.end_date IS NULL OR recurring_entries.end_date >= recurring_entries.start_date)
   `;
   const { rows: recurringRows } = await query(recurringSql, [cutoffIso]);
   if (recurringRows.length === 0) {
@@ -302,20 +357,66 @@ export async function materializeDueRecurringTransactions({ cutoffDate } = {}) {
     ON CONFLICT DO NOTHING
   `;
 
+  const transferInsertSql = `
+    WITH outgoing AS (
+      INSERT INTO transactions
+        (txn_date, description, amount, type, cleared, account_id, category_id, is_one_time, recurring_rule_id, transfer_pair_id)
+      VALUES ($1, $2, $3, 'expense', false, $4, $7, false, $5, $6)
+      RETURNING id
+    ), incoming AS (
+      INSERT INTO transactions
+        (txn_date, description, amount, type, cleared, account_id, category_id, is_one_time, recurring_rule_id, transfer_pair_id)
+      VALUES ($1, $8, $3, 'income', false, $9, $7, false, $5, $6)
+      RETURNING id
+    )
+    SELECT 1
+  `;
+
   let inserted = 0;
 
   for (const row of recurringRows) {
-    const scheduledDates = enumerateScheduledDates(row, cutoff);
     const mods = modsByRuleId.get(Number(row.id)) || [];
+    const scheduledDates = [
+      ...enumerateScheduledDates(row, cutoff),
+      ...getEarlyOverrideScheduledDates(mods, cutoffIso)
+    ];
 
     for (const dueDate of scheduledDates) {
       const mod = getApplicableModification(mods, dueDate);
-      const payload = buildOccurrencePayload(row, dueDate, mod);
+      if (mod && Boolean(mod.is_deleted)) {
+        continue;
+      }
+      const payload = row.type === "transfer"
+        ? buildTransferOccurrencePayload(row, dueDate, mod)
+        : buildOccurrencePayload(row, dueDate, mod);
       const txnDate = normalizeDate(payload.txn_date);
       if (!txnDate || txnDate > cutoffIso) continue;
 
       const dedupeKey = `${row.id}|${txnDate}`;
       if (existingKeys.has(dedupeKey)) continue;
+
+      if (payload.type === "transfer") {
+        const pairId = randomUUID();
+        const { outgoingDescription, incomingDescription } = buildTransferLegDescriptions(
+          payload.description,
+          row.from_account_name || String(row.from_account_id || "Transfer"),
+          row.to_account_name || String(row.to_account_id || "Transfer")
+        );
+        await query(transferInsertSql, [
+          txnDate,
+          outgoingDescription,
+          Number(payload.amount),
+          payload.from_account_id || null,
+          row.id,
+          pairId,
+          payload.category_id || null,
+          incomingDescription,
+          payload.to_account_id || null
+        ]);
+        existingKeys.add(dedupeKey);
+        inserted += 2;
+        continue;
+      }
 
       const insertResult = await query(insertSql, [
         txnDate,

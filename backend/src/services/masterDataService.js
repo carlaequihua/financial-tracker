@@ -236,16 +236,73 @@ export async function listSummary() {
 async function listCategoryTotals() {
   const { rows } = await query(
     `
+    WITH month_bounds AS (
+      SELECT
+        DATE_TRUNC('month', CURRENT_DATE)::date AS month_start,
+        (DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month')::date AS next_month_start
+    ),
+    current_month AS (
+      SELECT
+        t.category_id,
+        SUM(CASE WHEN t.type = 'expense' THEN t.amount ELSE 0 END) AS current_month_spent
+      FROM transactions t
+      CROSS JOIN month_bounds mb
+      WHERE t.txn_date >= mb.month_start
+        AND t.txn_date < mb.next_month_start
+      GROUP BY t.category_id
+    ),
+    current_month_total AS (
+      SELECT COALESCE(SUM(current_month_spent), 0) AS total_spent
+      FROM current_month
+    ),
+    categorized AS (
+      SELECT
+        c.id,
+        c.name,
+        COALESCE(SUM(CASE WHEN t.type = 'expense' THEN t.amount ELSE 0 END), 0)::numeric(12,2) AS total_spent,
+        COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE 0 END), 0)::numeric(12,2) AS total_income,
+        COUNT(t.id)::int AS transaction_count,
+        COALESCE(cm.current_month_spent, 0)::numeric(12,2) AS current_month_spent
+      FROM categories c
+      LEFT JOIN transactions t ON t.category_id = c.id
+      LEFT JOIN current_month cm ON cm.category_id = c.id
+      GROUP BY c.id, c.name, cm.current_month_spent
+    ),
+    uncategorized AS (
+      SELECT
+        NULL::int AS id,
+        'Other'::text AS name,
+        COALESCE(SUM(CASE WHEN t.type = 'expense' THEN t.amount ELSE 0 END), 0)::numeric(12,2) AS total_spent,
+        COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE 0 END), 0)::numeric(12,2) AS total_income,
+        COUNT(t.id)::int AS transaction_count,
+        COALESCE((
+          SELECT cm.current_month_spent
+          FROM current_month cm
+          WHERE cm.category_id IS NULL
+        ), 0)::numeric(12,2) AS current_month_spent
+      FROM transactions t
+      WHERE t.category_id IS NULL
+    ),
+    combined AS (
+      SELECT * FROM categorized
+      UNION ALL
+      SELECT * FROM uncategorized
+    )
     SELECT
-      c.id,
-      c.name,
-      COALESCE(SUM(CASE WHEN t.type = 'expense' THEN t.amount ELSE 0 END), 0)::numeric(12,2) AS total_spent,
-      COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE 0 END), 0)::numeric(12,2) AS total_income,
-      COUNT(t.id)::int AS transaction_count
-    FROM categories c
-    LEFT JOIN transactions t ON t.category_id = c.id
-    GROUP BY c.id, c.name
-    ORDER BY total_spent DESC, c.name ASC
+      x.id,
+      x.name,
+      x.total_spent,
+      x.total_income,
+      x.transaction_count,
+      x.current_month_spent,
+      CASE
+        WHEN cmt.total_spent = 0 THEN 0::numeric(7,2)
+        ELSE ROUND((x.current_month_spent / cmt.total_spent) * 100, 2)
+      END AS current_month_expense_pct
+    FROM combined x
+    CROSS JOIN current_month_total cmt
+    WHERE x.transaction_count > 0 OR x.id IS NOT NULL
+    ORDER BY x.current_month_spent DESC, x.total_spent DESC, x.name ASC
     `
   );
   return rows;

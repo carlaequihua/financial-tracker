@@ -47,6 +47,18 @@ function validateModification(input) {
     err.status = 400;
     throw err;
   }
+
+  if (input.is_deleted !== undefined && typeof input.is_deleted !== "boolean") {
+    const err = new Error("is_deleted must be a boolean if provided");
+    err.status = 400;
+    throw err;
+  }
+
+  if (input.is_deleted === true && input.modification_type !== "one_time") {
+    const err = new Error("is_deleted is only supported for one_time modifications");
+    err.status = 400;
+    throw err;
+  }
   if (input.amount !== undefined && input.amount !== null) {
     const amount = Number(input.amount);
     if (!Number.isFinite(amount) || amount < 0) {
@@ -78,7 +90,8 @@ export async function listModifications(recurringRuleId) {
     ...row,
     start_date: normalizeDate(row.start_date),
     end_date: normalizeDate(row.end_date),
-    override_txn_date: normalizeDate(row.override_txn_date)
+    override_txn_date: normalizeDate(row.override_txn_date),
+    is_deleted: Boolean(row.is_deleted)
   }));
 }
 
@@ -93,7 +106,8 @@ export async function createModification(input) {
           description = $4,
           account_id = $5,
           category_id = $6,
-          override_txn_date = $7
+          override_txn_date = $7,
+          is_deleted = $8
       WHERE recurring_rule_id = $1
         AND modification_type = 'one_time'
         AND start_date = $2
@@ -106,7 +120,8 @@ export async function createModification(input) {
       input.description || null,
       input.account_id || null,
       input.category_id || null,
-      normalizeDate(input.override_txn_date) || null
+      normalizeDate(input.override_txn_date) || null,
+      Boolean(input.is_deleted)
     ];
     const updatedExisting = await query(updateExistingSql, updateParams);
     if (updatedExisting.rowCount > 0) {
@@ -116,32 +131,8 @@ export async function createModification(input) {
 
   const sql = `
     INSERT INTO recurring_modifications
-    (recurring_rule_id, modification_type, start_date, end_date, amount, description, account_id, category_id, override_txn_date)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    RETURNING *
-  `;
-  const params = [
-    input.recurring_rule_id,
-    input.modification_type,
-    input.start_date,
-    input.end_date || null,
-    normalizeOptionalAmount(input.amount),
-    input.description || null,
-    input.account_id || null,
-    input.category_id || null,
-    input.modification_type === "one_time" ? (normalizeDate(input.override_txn_date) || null) : null
-  ];
-  const { rows } = await query(sql, params);
-  return rows[0];
-}
-
-export async function updateModification(id, input) {
-  validateModification(input);
-  const sql = `
-    UPDATE recurring_modifications
-    SET recurring_rule_id = $1, modification_type = $2, start_date = $3, end_date = $4,
-        amount = $5, description = $6, account_id = $7, category_id = $8, override_txn_date = $9
-    WHERE id = $10
+    (recurring_rule_id, modification_type, start_date, end_date, amount, description, account_id, category_id, override_txn_date, is_deleted)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     RETURNING *
   `;
   const params = [
@@ -154,6 +145,33 @@ export async function updateModification(id, input) {
     input.account_id || null,
     input.category_id || null,
     input.modification_type === "one_time" ? (normalizeDate(input.override_txn_date) || null) : null,
+    Boolean(input.is_deleted)
+  ];
+  const { rows } = await query(sql, params);
+  return rows[0];
+}
+
+export async function updateModification(id, input) {
+  validateModification(input);
+  const sql = `
+    UPDATE recurring_modifications
+    SET recurring_rule_id = $1, modification_type = $2, start_date = $3, end_date = $4,
+      amount = $5, description = $6, account_id = $7, category_id = $8, override_txn_date = $9,
+      is_deleted = $10
+    WHERE id = $11
+    RETURNING *
+  `;
+  const params = [
+    input.recurring_rule_id,
+    input.modification_type,
+    input.start_date,
+    input.end_date || null,
+    normalizeOptionalAmount(input.amount),
+    input.description || null,
+    input.account_id || null,
+    input.category_id || null,
+    input.modification_type === "one_time" ? (normalizeDate(input.override_txn_date) || null) : null,
+    Boolean(input.is_deleted),
     id
   ];
   const { rows } = await query(sql, params);
@@ -179,6 +197,7 @@ export async function getModificationsForDate(recurringRuleId, txnDate) {
     ...row,
     start_date: normalizeDate(row.start_date),
     end_date: normalizeDate(row.end_date),
-    override_txn_date: normalizeDate(row.override_txn_date)
+    override_txn_date: normalizeDate(row.override_txn_date),
+    is_deleted: Boolean(row.is_deleted)
   }));
 }
