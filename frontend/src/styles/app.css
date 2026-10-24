@@ -772,6 +772,11 @@ button.danger {
 .transactions-table td.inline-actions button {
   font-size: 0.76rem;
   padding: 0.4rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  vertical-align: middle;
 }
 
 .transactions-table .inline-edit-input {
@@ -790,6 +795,8 @@ button.danger {
 
 .transaction-order-controls {
   display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
   gap: 4px;
   flex-shrink: 0;
 }
